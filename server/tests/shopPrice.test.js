@@ -18,9 +18,11 @@ describe('ShopPrice historical preservation', () => {
     const productId = new mongoose.Types.ObjectId();
     const changedBy = new mongoose.Types.ObjectId();
 
-    await ShopPrice.create({ shopId, productId, price: 750, changedBy });
+    await ShopPrice.create({ shopId, productId, priceKobo: 75000, changedBy });
 
-    await expect(ShopPrice.create({ shopId, productId, price: 800, changedBy })).rejects.toThrow();
+    await expect(
+      ShopPrice.create({ shopId, productId, priceKobo: 80000, changedBy })
+    ).rejects.toThrow();
   });
 
   it('preserves a superseded price once it is closed out with effectiveTo', async () => {
@@ -28,17 +30,17 @@ describe('ShopPrice historical preservation', () => {
     const productId = new mongoose.Types.ObjectId();
     const changedBy = new mongoose.Types.ObjectId();
 
-    const original = await ShopPrice.create({ shopId, productId, price: 750, changedBy });
+    const original = await ShopPrice.create({ shopId, productId, priceKobo: 75000, changedBy });
     original.effectiveTo = new Date();
     await original.save();
 
-    await ShopPrice.create({ shopId, productId, price: 800, changedBy });
+    await ShopPrice.create({ shopId, productId, priceKobo: 80000, changedBy });
 
     const history = await ShopPrice.find({ shopId, productId }).sort({ effectiveFrom: 1 });
     expect(history).toHaveLength(2);
-    expect(history[0].price).toBe(750);
+    expect(history[0].priceKobo).toBe(75000);
     expect(history[0].effectiveTo).not.toBeNull();
-    expect(history[1].price).toBe(800);
+    expect(history[1].priceKobo).toBe(80000);
     expect(history[1].effectiveTo).toBeNull();
   });
 
@@ -46,7 +48,18 @@ describe('ShopPrice historical preservation', () => {
     const price = new ShopPrice({
       shopId: new mongoose.Types.ObjectId(),
       productId: new mongoose.Types.ObjectId(),
-      price: 0,
+      priceKobo: 0,
+      changedBy: new mongoose.Types.ObjectId(),
+    });
+
+    await expect(price.validate()).rejects.toThrow();
+  });
+
+  it('rejects a non-integer (fractional kobo) price', async () => {
+    const price = new ShopPrice({
+      shopId: new mongoose.Types.ObjectId(),
+      productId: new mongoose.Types.ObjectId(),
+      priceKobo: 750.5,
       changedBy: new mongoose.Types.ObjectId(),
     });
 

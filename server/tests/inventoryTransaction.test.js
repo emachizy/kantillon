@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import mongoose from 'mongoose';
 import { startTestDb, stopTestDb, clearTestDb } from './testDb.js';
 import { InventoryTransaction } from '../src/models/InventoryTransaction.js';
+import { getLagosBusinessDate } from '../src/utils/businessDate.js';
 
 beforeAll(startTestDb);
 afterAll(stopTestDb);
@@ -15,6 +16,7 @@ function baseTxn(overrides = {}) {
     direction: 'IN',
     quantity: 10,
     createdBy: new mongoose.Types.ObjectId(),
+    businessDate: getLagosBusinessDate(),
     ...overrides,
   });
 }

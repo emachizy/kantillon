@@ -4,7 +4,12 @@ import { Product } from '../models/Product.js';
 import { ApiError } from '../utils/ApiError.js';
 import { AUDIT_ACTIONS } from '../utils/constants.js';
 import { recordAudit } from './auditService.js';
-import { getInventoryBalance, hasOpeningStock } from './inventoryService.js';
+import {
+  getInventoryBalance,
+  hasOpeningStock,
+  hasAnyNonOpeningStockActivity,
+} from './inventoryService.js';
+import { getLagosBusinessDate } from '../utils/businessDate.js';
 
 // Opening stock is a one-time initialization (see model comment on
 // InventoryTransaction), not a way to correct stock later — that will be an
@@ -25,7 +30,19 @@ export async function createOpeningStock({ shopId, productId, quantity, notes, a
     throw ApiError.conflict('Opening stock has already been initialized for this shop/product');
   }
 
+  // Opening stock must be chronologically first. If normal inventory
+  // activity (a stock receipt, a sale) has already happened for this
+  // shop/product, initializing "opening stock" now would misrepresent
+  // history rather than establish it — that's what an adjustment/reversal
+  // workflow (a later phase) is for, not this endpoint.
+  if (await hasAnyNonOpeningStockActivity(shopId, productId)) {
+    throw ApiError.conflict(
+      'Inventory activity already exists for this shop/product; opening stock can only be set before any other movement'
+    );
+  }
+
   const now = new Date();
+  const businessDate = getLagosBusinessDate(now);
   let transaction;
   try {
     transaction = await InventoryTransaction.create({
@@ -41,6 +58,7 @@ export async function createOpeningStock({ shopId, productId, quantity, notes, a
       approvedBy: actingUser._id,
       approvedAt: now,
       notes,
+      businessDate,
     });
   } catch (err) {
     // Duplicate key on the partial unique index — another request won the

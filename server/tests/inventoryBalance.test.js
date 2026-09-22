@@ -5,6 +5,7 @@ import { createTestUser, createTestShop, createTestProduct, loginAgent } from '.
 import { ROLES } from '../src/utils/constants.js';
 import { InventoryTransaction } from '../src/models/InventoryTransaction.js';
 import { getInventoryBalance } from '../src/services/inventoryService.js';
+import { getLagosBusinessDate } from '../src/utils/businessDate.js';
 
 const app = createApp();
 
@@ -22,6 +23,7 @@ async function createTxn(shop, product, user, overrides = {}) {
     status: overrides.status || 'APPROVED',
     createdBy: user._id,
     referenceType: 'MANUAL',
+    businessDate: overrides.businessDate || getLagosBusinessDate(),
   });
 }
 

@@ -36,6 +36,11 @@ export function AppShell() {
             Approvals
           </NavLink>
         )}
+        {isOwner && (
+          <NavLink to="/daily-summary" className={navLinkClass}>
+            Daily Summary
+          </NavLink>
+        )}
         <NavLink to="/receipts" className={navLinkClass}>
           History
         </NavLink>

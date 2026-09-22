@@ -38,6 +38,16 @@ const inventoryTransactionSchema = new Schema(
     approvedBy: { type: Schema.Types.ObjectId, ref: 'User', default: null },
     approvedAt: { type: Date, default: null },
     notes: { type: String, trim: true },
+    // The business day this movement belongs to (Africa/Lagos, "YYYY-MM-DD")
+    // — NOT createdAt, which is a UTC wall-clock timestamp and says nothing
+    // about which business day a movement should be attributed to. Required
+    // for every new transaction; pre-Phase-3 documents are backfilled by
+    // migrations/2026-09-business-date-backfill.js.
+    businessDate: {
+      type: String,
+      required: true,
+      match: /^\d{4}-\d{2}-\d{2}$/,
+    },
   },
   { timestamps: true }
 );
@@ -45,6 +55,8 @@ const inventoryTransactionSchema = new Schema(
 // Ledger queries are almost always "give me this shop+product's movements".
 inventoryTransactionSchema.index({ shopId: 1, productId: 1, status: 1, createdAt: -1 });
 inventoryTransactionSchema.index({ referenceType: 1, referenceId: 1 });
+// Daily reconciliation queries filter by exactly this combination.
+inventoryTransactionSchema.index({ shopId: 1, productId: 1, businessDate: 1, status: 1 });
 
 // Opening stock is a one-time initialization, not a correction mechanism —
 // at most one OPENING_STOCK transaction may ever exist per shop/product.

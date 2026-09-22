@@ -9,6 +9,7 @@ import { Product } from '../models/Product.js';
 import { ShopPrice } from '../models/ShopPrice.js';
 import { createUser } from '../services/userService.js';
 import { ROLES } from '../utils/constants.js';
+import { nairaToKobo } from '../utils/money.js';
 
 const DEV_PASSWORD = 'DevPass123!';
 
@@ -76,9 +77,9 @@ async function seed() {
   await shopA.save();
 
   await ShopPrice.create([
-    { shopId: shopA._id, productId: product._id, price: 750, changedBy: owner._id },
-    { shopId: shopB._id, productId: product._id, price: 780, changedBy: owner._id },
-    { shopId: shopC._id, productId: product._id, price: 760, changedBy: owner._id },
+    { shopId: shopA._id, productId: product._id, priceKobo: nairaToKobo(750), changedBy: owner._id },
+    { shopId: shopB._id, productId: product._id, priceKobo: nairaToKobo(780), changedBy: owner._id },
+    { shopId: shopC._id, productId: product._id, priceKobo: nairaToKobo(760), changedBy: owner._id },
   ]);
 
   console.log('\nSeed complete. Development credentials (do NOT use in production):');

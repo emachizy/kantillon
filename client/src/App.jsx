@@ -4,6 +4,9 @@ import { HomePage } from './pages/HomePage.jsx';
 import { ShopInventoryPage } from './pages/ShopInventoryPage.jsx';
 import { PendingApprovalsPage } from './pages/PendingApprovalsPage.jsx';
 import { ReceiptHistoryPage } from './pages/ReceiptHistoryPage.jsx';
+import { DailyReportFormPage } from './pages/DailyReportFormPage.jsx';
+import { DailyReportDetailPage } from './pages/DailyReportDetailPage.jsx';
+import { OwnerDailySummaryPage } from './pages/OwnerDailySummaryPage.jsx';
 import { AppShell } from './components/AppShell.jsx';
 import { ProtectedRoute } from './routes/ProtectedRoute.jsx';
 
@@ -16,6 +19,12 @@ export default function App() {
         <Route element={<AppShell />}>
           <Route path="/" element={<HomePage />} />
           <Route path="/shops/:shopId" element={<ShopInventoryPage />} />
+          <Route
+            path="/shops/:shopId/products/:productId/daily-report"
+            element={<DailyReportFormPage />}
+          />
+          <Route path="/daily-reports/:id" element={<DailyReportDetailPage />} />
+          <Route path="/daily-summary" element={<OwnerDailySummaryPage />} />
           <Route path="/approvals" element={<PendingApprovalsPage />} />
           <Route path="/receipts" element={<ReceiptHistoryPage />} />
         </Route>

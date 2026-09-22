@@ -11,7 +11,7 @@ import { sendSuccess } from '../utils/apiResponse.js';
 import { catchAsync } from '../utils/catchAsync.js';
 
 export const postStockReceipt = catchAsync(async (req, res) => {
-  const { shopId, productId, quantity, deliveryReference, notes } = req.body;
+  const { shopId, productId, quantity, deliveryReference, notes, businessDate } = req.body;
 
   const { receipt, transaction } = await submitStockReceipt({
     shopId,
@@ -19,6 +19,7 @@ export const postStockReceipt = catchAsync(async (req, res) => {
     quantity,
     deliveryReference,
     notes,
+    businessDate,
     actingUser: req.user,
     req,
   });

@@ -1,16 +1,20 @@
 import { z } from 'zod';
-import { objectIdSchema } from './common.validators.js';
+import { objectIdSchema, businessDateSchema } from './common.validators.js';
 import { STOCK_RECEIPT_STATUS_VALUES } from '../utils/constants.js';
 
 // Deliberately has no "status" field — a client can never set a receipt's
 // status through this schema, even by sending one; unknown keys are
 // stripped by Zod's default object parsing before the controller sees them.
+// businessDate is optional here — the service defaults it to today's
+// Africa/Lagos business date when omitted, then validates it regardless of
+// where it came from (future-date and closed-business-day rules).
 export const createStockReceiptSchema = z.object({
   shopId: objectIdSchema,
   productId: objectIdSchema,
   quantity: z.number().positive('Quantity must be greater than zero'),
   deliveryReference: z.string().trim().max(200).optional(),
   notes: z.string().trim().max(500).optional(),
+  businessDate: businessDateSchema.optional(),
 });
 
 export const rejectStockReceiptSchema = z.object({

@@ -25,6 +25,18 @@ const stockReceiptSchema = new Schema(
     notes: { type: String, trim: true },
     receivedBy: { type: Schema.Types.ObjectId, ref: 'User', required: true },
     receivedAt: { type: Date, required: true, default: Date.now },
+    // The business day this receipt is reported against (Africa/Lagos,
+    // "YYYY-MM-DD"), independent of receivedAt's UTC timestamp. Defaults to
+    // today's Lagos business date if the client omits it; always validated
+    // server-side (future dates and already-closed business days are
+    // rejected — see services/stockReceiptService.js). Pre-Phase-3
+    // documents are backfilled by
+    // migrations/2026-09-business-date-backfill.js.
+    businessDate: {
+      type: String,
+      required: true,
+      match: /^\d{4}-\d{2}-\d{2}$/,
+    },
     status: {
       type: String,
       enum: STOCK_RECEIPT_STATUS_VALUES,
@@ -46,5 +58,6 @@ const stockReceiptSchema = new Schema(
 
 stockReceiptSchema.index({ shopId: 1, status: 1, createdAt: -1 });
 stockReceiptSchema.index({ productId: 1 });
+stockReceiptSchema.index({ shopId: 1, productId: 1, businessDate: 1, status: 1 });
 
 export const StockReceipt = mongoose.model('StockReceipt', stockReceiptSchema);

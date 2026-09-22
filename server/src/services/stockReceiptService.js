@@ -1,11 +1,14 @@
 import { StockReceipt } from '../models/StockReceipt.js';
 import { InventoryTransaction } from '../models/InventoryTransaction.js';
+import { DailySalesReport } from '../models/DailySalesReport.js';
 import { Shop } from '../models/Shop.js';
 import { Product } from '../models/Product.js';
 import { ApiError } from '../utils/ApiError.js';
 import { AUDIT_ACTIONS } from '../utils/constants.js';
 import { recordAudit } from './auditService.js';
 import { getInventoryBalance } from './inventoryService.js';
+import { getLatestClosedBusinessDate } from './dailySalesReportService.js';
+import { getLagosBusinessDate, isFutureBusinessDate } from '../utils/businessDate.js';
 import { runWithOptionalTransaction } from '../utils/transactionRunner.js';
 
 const RECEIPT_POPULATE = [
@@ -22,6 +25,7 @@ export async function submitStockReceipt({
   quantity,
   deliveryReference,
   notes,
+  businessDate: requestedBusinessDate,
   actingUser,
   req,
 }) {
@@ -33,6 +37,35 @@ export async function submitStockReceipt({
   if (!product.isActive) throw ApiError.badRequest('Product is not active');
 
   const receivedAt = new Date();
+  const businessDate = requestedBusinessDate || getLagosBusinessDate(receivedAt);
+
+  if (isFutureBusinessDate(businessDate, receivedAt)) {
+    throw ApiError.badRequest('businessDate cannot be in the future');
+  }
+
+  // A daily sales report closes its exact business date; a stock receipt
+  // dated that same day would change "approved stock received for the
+  // day" after the report already calculated expected closing stock from
+  // it. And a receipt dated earlier than the latest closed period would
+  // silently rewrite an already-reconciled day.
+  const [closedForThisDate, latestClosed] = await Promise.all([
+    DailySalesReport.exists({ shopId, productId, businessDate }),
+    getLatestClosedBusinessDate(shopId, productId),
+  ]);
+
+  if (closedForThisDate) {
+    throw ApiError.conflict(
+      `Business date ${businessDate} is already closed by a daily sales report for this shop/product; ` +
+        'an owner adjustment/correction workflow will be required to change it (a later phase)'
+    );
+  }
+
+  if (latestClosed && businessDate < latestClosed) {
+    throw ApiError.conflict(
+      `A later business date (${latestClosed}) has already been closed for this shop/product; ` +
+        'a stock receipt cannot be backdated before it'
+    );
+  }
 
   // The only multi-document create in Phase 2 — a receipt plus its linked
   // PENDING ledger row. No concurrent writer contends for these (they're
@@ -60,6 +93,7 @@ export async function submitStockReceipt({
             notes,
             receivedBy: actingUser._id,
             receivedAt,
+            businessDate,
             status: 'PENDING',
           },
         ],
@@ -71,6 +105,7 @@ export async function submitStockReceipt({
           {
             shopId,
             productId,
+            businessDate,
             type: 'STOCK_RECEIPT',
             direction: 'IN',
             quantity,

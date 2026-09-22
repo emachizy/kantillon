@@ -7,6 +7,7 @@ import { ROLES } from '../src/utils/constants.js';
 import { AuditLog } from '../src/models/AuditLog.js';
 import { StockReceipt } from '../src/models/StockReceipt.js';
 import { InventoryTransaction } from '../src/models/InventoryTransaction.js';
+import { DailySalesReport } from '../src/models/DailySalesReport.js';
 
 const app = createApp();
 
@@ -368,5 +369,57 @@ describe('standalone-MongoDB partial-failure compensation on submission', () => 
     } finally {
       spy.mockRestore();
     }
+  });
+});
+
+async function closeBusinessDate(shop, product, owner, businessDate) {
+  return DailySalesReport.create({
+    shopId: shop._id,
+    productId: product._id,
+    businessDate,
+    salesLines: [{ quantity: 10, unitPriceKobo: 100000, lineRevenueKobo: 1000000 }],
+    openingStockQuantity: 100,
+    approvedStockReceivedQuantity: 0,
+    availableStockQuantity: 100,
+    totalQuantitySold: 10,
+    expectedClosingStockQuantity: 90,
+    physicalClosingStockQuantity: 90,
+    stockVarianceQuantity: 0,
+    expectedRevenueKobo: 1000000,
+    actualAmountCollectedKobo: 1000000,
+    moneyVarianceKobo: 0,
+    submittedBy: owner._id,
+  });
+}
+
+describe('stock receipt business-date closure rules', () => {
+  it('rejects a new stock receipt dated a business day already closed by a daily report', async () => {
+    const { shopA, product, owner } = await setup();
+    await closeBusinessDate(shopA, product, owner, '2020-01-10');
+
+    const sales = await loginAgent(app, 'sales@test.dev');
+    const res = await submitReceipt(sales, shopA, product, { businessDate: '2020-01-10' });
+
+    expect(res.status).toBe(409);
+  });
+
+  it('rejects a backdated stock receipt before an already-closed later business day', async () => {
+    const { shopA, product, owner } = await setup();
+    await closeBusinessDate(shopA, product, owner, '2020-01-10');
+
+    const sales = await loginAgent(app, 'sales@test.dev');
+    const res = await submitReceipt(sales, shopA, product, { businessDate: '2020-01-08' });
+
+    expect(res.status).toBe(409);
+  });
+
+  it('allows a stock receipt dated after the latest closed business day', async () => {
+    const { shopA, product, owner } = await setup();
+    await closeBusinessDate(shopA, product, owner, '2020-01-10');
+
+    const sales = await loginAgent(app, 'sales@test.dev');
+    const res = await submitReceipt(sales, shopA, product, { businessDate: '2020-01-11' });
+
+    expect(res.status).toBe(201);
   });
 });

@@ -5,6 +5,8 @@ import shopRoutes from './shop.routes.js';
 import productRoutes from './product.routes.js';
 import inventoryRoutes from './inventory.routes.js';
 import stockReceiptRoutes from './stockReceipt.routes.js';
+import dailySalesReportRoutes from './dailySalesReport.routes.js';
+import shopPriceRoutes from './shopPrice.routes.js';
 
 const router = Router();
 
@@ -14,5 +16,7 @@ router.use('/shops', shopRoutes);
 router.use('/products', productRoutes);
 router.use('/inventory', inventoryRoutes);
 router.use('/stock-receipts', stockReceiptRoutes);
+router.use('/daily-reports', dailySalesReportRoutes);
+router.use('/shop-prices', shopPriceRoutes);
 
 export default router;

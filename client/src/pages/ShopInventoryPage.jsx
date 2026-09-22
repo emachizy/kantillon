@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useParams } from 'react-router-dom';
+import { useParams, Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useAuth } from '../context/AuthContext.jsx';
 import { fetchShopInventory, createOpeningStock } from '../api/inventory.js';
@@ -179,18 +179,26 @@ export function ShopInventoryPage() {
             )}
 
             {!isOwner && (
-              <ReceiptForm
-                product={line.product}
-                isPending={receiptMutation.isPending}
-                error={receiptMutation.error}
-                isSuccess={
-                  receiptMutation.isSuccess &&
-                  receiptMutation.variables?.productId === line.product.id
-                }
-                onSubmit={(payload) =>
-                  receiptMutation.mutate({ shopId, productId: line.product.id, ...payload })
-                }
-              />
+              <>
+                <ReceiptForm
+                  product={line.product}
+                  isPending={receiptMutation.isPending}
+                  error={receiptMutation.error}
+                  isSuccess={
+                    receiptMutation.isSuccess &&
+                    receiptMutation.variables?.productId === line.product.id
+                  }
+                  onSubmit={(payload) =>
+                    receiptMutation.mutate({ shopId, productId: line.product.id, ...payload })
+                  }
+                />
+                <Link
+                  to={`/shops/${shopId}/products/${line.product.id}/daily-report`}
+                  className="mt-2 block rounded-md border border-slate-300 px-3 py-2 text-center text-sm font-medium text-slate-700"
+                >
+                  Submit daily report
+                </Link>
+              </>
             )}
           </div>
         ))}

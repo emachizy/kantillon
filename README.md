@@ -2,7 +2,7 @@
 
 A multi-shop cement inventory, sales, and reconciliation system for a business owner running several independent shops.
 
-> **Phase 1 + Phase 2 scope.** Phase 1 built the project foundation: backend architecture, authentication/authorization, core database models, validation, and development seed data, plus a minimal frontend shell. Phase 2 adds the first complete inventory workflow: opening-stock initialization, staff-submitted stock receipts, owner approval/rejection, and ledger-derived inventory balances, plus the minimal mobile-first UI to operate it. Daily sales, end-of-day reconciliation, revenue, stock variance, credit sales, expenses, reporting, and stock transfers are **not** implemented yet — they are later phases.
+> **Phase 1 + 2 + 3 scope.** Phase 1 built the project foundation. Phase 2 added opening-stock initialization, staff-submitted stock receipts, owner approval/rejection, and ledger-derived inventory balances. Phase 3 (this phase) adds the daily end-of-day workflow: staff report bags sold, physical closing stock, and money collected; the backend calculates expected stock, expected revenue, stock variance, and money variance, and books an immediate `SALE` ledger transaction. Credit sales, expenses, payroll, stock transfers, advanced reporting, stock adjustments, and automatic discrepancy correction are **not** implemented yet — they are later phases.
 
 ## Project purpose
 
@@ -112,6 +112,96 @@ The spec named `OWNER`, `MANAGER`, and `SALESPERSON` explicitly for every Phase 
 
 This is a design choice, not an accidental gap — revisit it explicitly if a later phase defines real `ADMIN` responsibilities.
 
+## Phase 3: daily sales & reconciliation
+
+Phase 3 answers one question per shop/product/business-day: **"were the bags and the money reported consistent with what should have been there?"** It never tries to auto-fix the answer if it's "no."
+
+> **A physical stock discrepancy never automatically changes official inventory. A money discrepancy never automatically changes sales quantities or prices.** Both are recorded exactly as calculated, permanently, on the `DailySalesReport` snapshot — correcting them is a future, explicit owner adjustment/reversal workflow, not something this phase does silently.
+
+### Business date (`businessDate`)
+
+`createdAt` is a UTC wall-clock timestamp and is **not** the business date. Every Phase 3 (and now Phase 2) record carries an explicit `businessDate` string in canonical `YYYY-MM-DD` form, computed in the **Africa/Lagos** timezone via `utils/businessDate.js` (`Intl.DateTimeFormat` with an explicit `timeZone: 'Africa/Lagos'` — never the server machine's own timezone). Lagos has no DST, but the code still goes through `Intl` rather than hardcoding a UTC+1 offset, since that's the correct general approach. Future business dates are always rejected.
+
+### Sales lines & multiple prices per day (intentional)
+
+A single business day can have more than one selling price — e.g. a price change mid-afternoon. `DailySalesReport.salesLines` is an array of `{ quantity, unitPriceKobo, lineRevenueKobo }`, 1–20 lines. **Each line's price is stored permanently on the report.** Changing the active `ShopPrice` tomorrow (or five minutes later) never recalculates yesterday's — or even today's already-submitted — report; verified directly (`tests/dailySalesReport.test.js` "Price history independence", and confirmed live by changing a shop's active price after submission and re-reading the report unchanged). The active `ShopPrice` is only ever used as a **UI default** for the first line via `GET /api/shop-prices/shop/:shopId/product/:productId/current` — staff can override it if the actual selling price differed.
+
+### Money: integer kobo only
+
+All money fields (`unitPriceKobo`, `lineRevenueKobo`, `expectedRevenueKobo`, `actualAmountCollectedKobo`, `moneyVarianceKobo`, and `ShopPrice.priceKobo`) are **integer kobo**, never a floating-point Naira number. `utils/money.js` (server) and `utils/money.js` (client) convert Naira input to kobo via **string manipulation**, not `parseFloat(x) * 100` — a naive float multiplication can misround values like ₦12.15 due to binary floating-point representation; string-based parsing avoids that entirely (verified in `tests/money.test.js`, including a large-value test proving no drift). Every money field is validated as a JS safe integer (`Number.isSafeInteger`).
+
+### Formulas
+
+```
+availableStockQuantity = openingStockQuantity + approvedStockReceivedQuantity
+expectedClosingStockQuantity = availableStockQuantity − totalQuantitySold
+stockVarianceQuantity = physicalClosingStockQuantity − expectedClosingStockQuantity
+    (negative = SHORTAGE, positive = SURPLUS, zero = BALANCED)
+
+lineRevenueKobo = quantity × unitPriceKobo            (per sales line)
+expectedRevenueKobo = SUM(lineRevenueKobo)
+moneyVarianceKobo = actualAmountCollectedKobo − expectedRevenueKobo
+    (negative = short, positive = excess collected, zero = BALANCED)
+```
+
+**Opening stock for a business date** is the approved ledger balance strictly *before* that date, with one deliberate exception: if the shop's `OPENING_STOCK` initialization itself happened *on* that business date, it counts as available for that first day (otherwise a shop initialized and sold to on the same day would incorrectly show zero opening stock). Implemented in `inventoryService.getOpeningStockForBusinessDate` — a reusable service function, not duplicated ledger math in a controller.
+
+**Approved stock received for a business date** counts only `APPROVED` `STOCK_RECEIPT`/`IN` transactions dated exactly that day — `PENDING` and `REJECTED` receipts never count (`inventoryService.getApprovedStockReceivedForBusinessDate`).
+
+**Insufficient stock**: if `totalQuantitySold` would exceed `availableStockQuantity`, submission is rejected with `409` rather than silently producing a negative expected closing stock.
+
+### Physical count vs. official ledger (the critical invariant)
+
+The worked example from the spec, verified live end-to-end against a running server:
+
+```
+Opening stock:      1000
+Approved receipts:   500
+Bags sold:          -400
+Expected closing:   1100   ← this is what the ledger balance becomes
+Physical closing:   1097
+Stock variance:       -3   ← SHORTAGE, recorded on the report only
+```
+
+`GET /api/inventory/shop/:shopId` continues to report **1100** after this submission — the physical count of 1097 is stored on the `DailySalesReport` for visibility and never overwrites, adjusts, or otherwise touches the ledger. The only way official stock changes is the `SALE` transaction itself (`-400`, `APPROVED`, immediate — sales don't require owner approval in Phase 3, unlike stock receipts).
+
+### Closed business-date rule
+
+Submitting a `DailySalesReport` for shopId+productId+businessDate **closes** that business day for that shop/product:
+
+- A second report for the same `{shopId, productId, businessDate}` is rejected (`409`) — enforced by a **database-level unique index**, not just an app-level check (verified with a real concurrent-submission test: two simultaneous requests, exactly one `201`, one `409`, exactly one `SALE` effect).
+- A report dated earlier than an already-closed later date for the same shop/product is rejected (`409`) — protects chronological ledger integrity.
+- A **new stock receipt** dated a day already closed by a report, or backdated before an already-closed later day, is rejected (`409`) — see `stockReceiptService.submitStockReceipt`.
+- A report **cannot** be submitted while a stock receipt for that exact shop/product/business-date is still `PENDING` (`409`) — expected closing stock isn't authoritative until that receipt is resolved one way or the other.
+
+### Report immutability
+
+A submitted `DailySalesReport` is permanent in Phase 3 — there is no edit or delete endpoint (`PUT`/`PATCH`/`DELETE` all return `404`, verified by test). A future reversal/correction workflow will handle mistakes without erasing history, the same principle Phase 2 established for stock receipts.
+
+### Concurrency & standalone-MongoDB compensation (reuses the Phase 2 strategy)
+
+Creating a `DailySalesReport` plus its linked `SALE` `InventoryTransaction` is the same shape of multi-document problem Phase 2 solved for stock receipts, and reuses the identical strategy (see "Concurrency & consistency strategy" above): `utils/transactionRunner.js` attempts a real session transaction and falls back to sequential writes with explicit compensating cleanup on this standalone instance. Two dedicated tests force a failure at each write point (`vi.spyOn`) and assert no orphaned `DailySalesReport` or `SALE` transaction remains in either case.
+
+### API endpoints
+
+| Endpoint | Access |
+| --- | --- |
+| `POST /api/daily-reports` | OWNER, MANAGER, SALESPERSON — only for a shop they can access. **Not ADMIN** |
+| `GET /api/daily-reports` (filters: `shopId`, `productId`, `businessDate`) | OWNER (all/filtered); everyone else, including ADMIN (assigned shops only) |
+| `GET /api/daily-reports/:id` | Same shop-access rule, checked against the report's own shop |
+| `GET /api/daily-reports/summary?businessDate=YYYY-MM-DD` | OWNER only — cross-shop view for one business date |
+| `GET /api/shop-prices/shop/:shopId/product/:productId/current` | OWNER (any shop); everyone else (assigned shops only) — read-only UI default |
+
+No edit/delete endpoints exist for `DailySalesReport`, matching the immutability rule above.
+
+### Authorization (ADMIN, again)
+
+Same conservative stance as Phase 2: `ADMIN` gets no new write capability here either. It cannot submit a daily report (`403`, tested) but can read reports for shops it's assigned to, exactly like Phase 2's inventory/receipt reads.
+
+### What Phase 3 still doesn't do
+
+No credit sales, expenses, payroll, stock transfers, advanced reporting, or automatic stock/money adjustment — all explicitly out of scope. No adjustment/reversal workflow yet (a discrepancy is recorded, never auto-corrected); that's an explicit future phase, as the spec requires.
+
 ## Folder structure
 
 ```
@@ -121,24 +211,32 @@ server/
     controllers/  request handlers (thin — call services)
     middleware/   auth, validation, error handling, rate limiting
     models/       Mongoose schemas (User, Shop, Product, ShopPrice,
-                   InventoryTransaction, AuditLog, StockReceipt)
+                   InventoryTransaction, AuditLog, StockReceipt,
+                   DailySalesReport)
     routes/       Express routers
     services/     business logic (auth, users, shop access, inventory
-                   balances, opening stock, stock receipts, audit)
+                   balances, opening stock, stock receipts, daily sales
+                   reports, shop prices, audit)
     utils/        constants, ApiError, response helpers, JWT/cookie helpers,
-                   optional-transaction runner
+                   optional-transaction runner, money (integer kobo),
+                   businessDate (Africa/Lagos)
     validators/   Zod schemas
     seed/         development seed script
+    migrations/   idempotent, additive data migrations (see "Tests" below
+                   for how they're verified)
   tests/          Vitest + Supertest test suite
 
 client/
   src/
     api/          Axios client + typed request helpers (auth, shops,
-                   inventory, stock receipts)
+                   inventory, stock receipts, daily reports, shop prices)
     context/      AuthContext (session state via TanStack Query)
     routes/       ProtectedRoute
+    utils/        money (Naira <-> kobo), businessDate (Africa/Lagos)
     pages/        LoginPage, HomePage (role-branches to Owner/Staff home),
-                   ShopInventoryPage, PendingApprovalsPage, ReceiptHistoryPage
+                   ShopInventoryPage, PendingApprovalsPage, ReceiptHistoryPage,
+                   DailyReportFormPage, DailyReportDetailPage,
+                   OwnerDailySummaryPage
     components/   AppShell (mobile-first top bar + bottom tab nav)
 ```
 
@@ -213,13 +311,27 @@ cd server
 npm run seed
 ```
 
-This **wipes and re-seeds** `Users`, `Shops`, `Products`, and `ShopPrice` in whatever database `MONGO_URI` points to — only ever run it against a development database. It refuses to run at all if `NODE_ENV=production` (hard exit, not just a comment), so it cannot accidentally wipe and reseed a production database. It does not create any opening stock or stock receipts — every seeded shop starts with zero inventory so the Phase 2 workflow can be exercised from a clean slate.
+This **wipes and re-seeds** `Users`, `Shops`, `Products`, and `ShopPrice` in whatever database `MONGO_URI` points to — only ever run it against a development database. It refuses to run at all if `NODE_ENV=production` (hard exit, not just a comment), so it cannot accidentally wipe and reseed a production database. It does not create any opening stock or stock receipts — every seeded shop starts with zero inventory so the Phase 2/3 workflow can be exercised from a clean slate. `ShopPrice` rows are seeded directly with `priceKobo` (the Phase 3 field).
 
 Seeds:
 - 1 product: Lafarge Cement (`LAF-50KG`, unit `bag`)
 - 3 shops: Shop A (`SHOP-A`), Shop B (`SHOP-B`), Shop C (`SHOP-C`)
 - 1 OWNER, 1 MANAGER (assigned to Shop A), 1 SALESPERSON (assigned to Shop A)
-- A current selling price per shop for the seeded product
+- A current selling price per shop for the seeded product (integer kobo)
+
+### Migrations (Phase 3)
+
+```bash
+cd server
+npm run migrate
+```
+
+Runs two one-time, **additive and idempotent** data migrations against `MONGO_URI` — safe to run against development *or* production, and safe to run more than once (unlike `seed`, these are deliberately **not** guarded against `NODE_ENV=production`, since backfilling a missing field on real data is exactly what a production database needs when a schema evolves):
+
+1. `migrations/2026-09-shopprice-price-to-kobo.js` — backfills legacy `ShopPrice.price` (Naira) into `priceKobo` (integer kobo) via `utils/money.js`'s string-based `nairaToKobo`, then removes the old field.
+2. `migrations/2026-09-business-date-backfill.js` — backfills `businessDate` onto pre-Phase-3 `StockReceipt` and `InventoryTransaction` documents, derived from `receivedAt`/`createdAt`/`approvedAt` via `utils/businessDate.js` (Africa/Lagos). `StockReceipt` is migrated first so linked `STOCK_RECEIPT`-type ledger rows can inherit the receipt's `businessDate` for consistency.
+
+Both operate on raw collections (not the Mongoose model) so they can read documents from before the schema required these fields, and both were verified against this project's own `kantillon_dev` database, which had live test data predating Phase 3: 3 `ShopPrice`, 5 `InventoryTransaction`, and 3 `StockReceipt` documents were migrated with **zero data loss** (same document counts before and after), and a second run confirmed idempotency (`0 document(s) migrated`).
 
 ### Development credentials
 
@@ -242,7 +354,7 @@ Tests run against a real local MongoDB database (`kantillon_test` by default, ov
 
 **Test database safety guard.** Every destructive test operation (`deleteMany`, `dropDatabase` in `tests/testDb.js`) is gated by `assertSafeTestDatabase()`, which fails closed: it throws unless `NODE_ENV` is exactly `"test"` **and** the actually-connected database name (checked on the live connection, not the configured URI string) is exactly `kantillon_test`. This is verified by `tests/testDbSafety.test.js` and was manually confirmed to block real attempts to run against `NODE_ENV=development` and against a `MONGO_TEST_URI` pointed at `kantillon_dev` — both refused before touching any data. The auth rate limiter is skipped only under `NODE_ENV=test` (`middleware/rateLimiters.js`), since the suite logs in far more often per minute than any real client (each test needs a fresh user after `clearTestDb`); this never applies outside test.
 
-**59 tests across 8 files**, including (Phase 1, preserved unchanged):
+**124 tests across 11 files**, including (Phase 1, preserved unchanged):
 - Login succeeds with valid credentials and sets an httpOnly cookie / fails with invalid credentials / rejects a deactivated user
 - Unauthenticated requests are rejected on protected routes
 - `passwordHash` is never present in any API response
@@ -257,6 +369,26 @@ Phase 2 additions:
 - Inventory balance: only `APPROVED` counts (`PENDING`/`REJECTED`/`VOIDED` excluded), `IN` increases, `OUT` decreases, unauthorized cross-shop read returns `403`, and an ADMIN assigned to a shop can read its inventory (confirming ADMIN's read access is intact even though its write access is restricted)
 - Test database safety guard behavior itself (5 tests)
 
+Phase 3 additions (65 new tests across `dailySalesReport.test.js`, `money.test.js`, `businessDate.test.js`, plus additions to `stockReceipt.test.js`, `openingStock.test.js`, `inventoryBalance.test.js`, `shopPrice.test.js`, `inventoryTransaction.test.js`):
+- Money utilities: Naira→kobo/kobo→Naira conversion without float drift, safe-integer validation, a large-value exactness check
+- Business-date utility: canonical `YYYY-MM-DD` output, Africa/Lagos-correct rollover at the UTC boundary, format/calendar validation, comparison, future-date detection
+- Migration idempotency: `price`→`priceKobo` and `businessDate` backfills, each run twice with the second run asserted as a no-op, using raw-collection fixtures predating the current schema
+- Basic access: assigned salesperson/manager can submit, unauthorized shop and ADMIN both rejected (403), future business date and malformed ids rejected (400), inactive shop/product rejected (400)
+- Sales calculations: single- and multi-line revenue calculated correctly, `totalQuantitySold`/line revenue always server-computed, a client cannot spoof `expectedRevenueKobo`/`stockVarianceQuantity`/`status`/`submittedBy`/etc. (all silently stripped or overwritten), fractional quantities and unsafe/non-integer money rejected
+- Stock reconciliation: the exact worked example from the spec (opening 1000 + received 500 − sold 400 = expected 1100, physical 1097 ⇒ variance −3, expected revenue ₦4,875,000, collected ₦4,850,000 ⇒ money variance −₦25,000) end-to-end; same-day `OPENING_STOCK` counts on the first business day; approved-only same-day receipts count (pending/rejected excluded); a pending same-day receipt blocks submission (409); zero/negative/positive variance all calculated correctly; the ledger balance is proven unchanged by physical count; reported sales exceeding approved available stock rejected (409)
+- Money reconciliation: exact/short/excess collection variance, very large integer values calculated without floating-point drift
+- Ledger: exactly one `APPROVED SALE OUT` transaction per report, quantity matches `totalQuantitySold`, balance decreases correctly, a duplicate report never creates a second `SALE` effect
+- Concurrency: a genuine simultaneous double-submission test — exactly one `201`, one `409`, exactly one report and one `SALE` effect
+- Chronological order: an earlier report after a later one is closed is rejected (409); a new/backdated stock receipt on/before an already-closed day is rejected (409)
+- Immutability: no `PUT`/`PATCH`/`DELETE` route exists for a report (all `404`)
+- Compensation: two forced-failure tests (`vi.spyOn`) proving no orphaned `DailySalesReport` or `SALE` transaction survives either failure point
+- Audit: successful submission creates a `DAILY_SALES_REPORT_SUBMITTED` entry
+- Read access: OWNER sees all reports, SALESPERSON/ADMIN see only their assigned shop's reports, an unauthorized report id returns 403
+- Price-history independence: changing the active `ShopPrice` after submission never alters an already-saved report's line prices or expected revenue
+- Opening-stock hardening: initialization is rejected once any other ledger activity already exists for that shop/product
+
+Also verified live against a running server (not just automated tests): the full opening-stock → receipt → approval → daily-report → inventory-check → owner-summary flow reproduces the spec's worked example exactly, and changing a shop's active price after submission leaves the saved report's `unitPriceKobo`/`expectedRevenueKobo` untouched.
+
 ## API surface
 
 **Phase 1:**
@@ -269,12 +401,15 @@ Phase 2 additions:
 
 **Phase 2:** see "Inventory & stock-receipt API summary" above for the full list (`/api/inventory/opening-stock`, `/api/inventory/shop/:shopId`, `/api/stock-receipts` and its sub-routes).
 
+**Phase 3:** see "API endpoints" under "Phase 3: daily sales & reconciliation" above (`/api/daily-reports` and its sub-routes, `/api/shop-prices/.../current`).
+
 ## Frontend (mobile-first)
 
-- **OWNER** sees a Home screen listing every shop with its current balance and a pending-approvals count; tapping a shop opens its inventory, where any uninitialized product shows an "Initialize opening stock" form; a bottom-nav "Approvals" tab lists every pending receipt with Approve / Reject (reason required) actions.
-- **MANAGER / SALESPERSON** see a Home screen listing only their assigned shop(s); opening a shop shows its inventory (read-only) plus a "Report stock received" form; a "History" tab shows their shop's stock-receipt history and status.
-- All server state is fetched via TanStack Query; every mutation (opening stock, submit/approve/reject) invalidates the relevant `inventory` and `stockReceipts` query keys so balances and lists refetch automatically. Every page has explicit loading, error (including a distinct message for `403`), and success states.
-- Frontend role checks (e.g. hiding the opening-stock form from non-owners) are UX only — every rule is re-enforced server-side, and was verified live: a salesperson hitting the owner-only approve endpoint gets `403`, and a salesperson cannot read another shop's inventory by editing the URL.
+- **OWNER** sees a Home screen listing every shop with its current balance and a pending-approvals count; tapping a shop opens its inventory, where any uninitialized product shows an "Initialize opening stock" form; a bottom-nav "Approvals" tab lists every pending receipt with Approve / Reject (reason required) actions; a "Daily Summary" tab lets the owner pick a business date and see every submitted shop/product report as a card (bags sold, expected/physical closing, stock status, expected/collected revenue, money status — shortage/surplus stated in text, never color alone), tappable through to the full report detail.
+- **MANAGER / SALESPERSON** see a Home screen listing only their assigned shop(s); opening a shop shows its inventory (read-only) plus a "Report stock received" form and a "Submit daily report" link; the daily report form defaults the business date to today's Africa/Lagos date and the first sales line's price to the shop's active `ShopPrice`, supports adding/removing up to 20 price lines, shows a clearly-labeled non-authoritative preview (total bags, expected revenue) before submission, and displays the full backend-calculated result (bags sold, expected/physical closing, stock variance, expected revenue, amount collected, money variance) after; a "History" tab shows their shop's stock-receipt history and status.
+- All server state is fetched via TanStack Query; every mutation (opening stock, submit/approve/reject, daily report submission) invalidates the relevant `inventory`, `stockReceipts`, and `dailyReports` query keys so balances and lists refetch automatically. Every page has explicit loading, error (including a distinct message for `403`), and success states.
+- Money is entered and displayed in Naira but converted to/from integer kobo via `utils/money.js` (string-based, not `parseFloat(x) * 100`) before ever reaching the API.
+- Frontend role checks (e.g. hiding the opening-stock form from non-owners, hiding "Daily Summary" from non-owners) are UX only — every rule is re-enforced server-side, and was verified live: a salesperson hitting the owner-only approve endpoint gets `403`, and a salesperson cannot read another shop's inventory by editing the URL.
 
 ## Assumptions made in Phase 1
 
@@ -302,3 +437,19 @@ Phase 2 additions:
 - No daily sales, end-of-day reconciliation, revenue calculations, stock variance, credit sales, expenses, advanced reporting, or stock transfers — all explicitly out of scope for this phase.
 - No adjustment/reversal workflow yet — the model supports it (`ADJUSTMENT`, `REVERSAL` transaction types already exist in the enum), but no service/route uses them yet.
 - No pagination on `GET /api/stock-receipts` — acceptable at current scale per the spec; would need adding before shop/receipt counts grow large.
+
+## Assumptions made in Phase 3
+
+- Daily report submission is restricted to `OWNER`, `MANAGER`, `SALESPERSON` — not `ADMIN` — for the same reason as Phase 2's stock receipts: the spec named these roles explicitly and never granted `ADMIN` new write capability.
+- "Future business date" rejection uses `400` (a validation-shaped rule, syntactically valid input that's rejected on a business rule) rather than `409`; duplicate/closed-day/chronological-order/pending-receipt conflicts all use `409` (an existing-state conflict), matching the status-code guidance the spec gave elsewhere.
+- `GET /api/daily-reports` and `/summary` don't block reads against an inactive shop, mirroring the same Phase 2 decision for inventory reads — only report *submission* is blocked for an inactive shop/product.
+- The opening-stock hardening rule ("reject if any other ledger activity already exists") is enforced as an app-level pre-check, not a new database-level constraint — the concurrency guarantee the spec actually asks for (no double opening-stock) was already covered by Phase 2's partial unique index, which this rule doesn't weaken or replace.
+- `DailySalesReport.status` has a single enum value (`SUBMITTED`) rather than being left as a free string — deliberately narrow now, but present specifically so a future reversal/correction workflow has somewhere to record a different state without a schema migration.
+- Migrations live under `server/src/migrations/` as plain idempotent scripts run via `npm run migrate`, rather than a migration-framework dependency — appropriate at this scale (two migrations, both additive) without pulling in a tool this project doesn't otherwise need.
+
+## Known Phase 3 gaps (by design — later phases)
+
+- No credit sales, expenses, payroll, stock transfers, advanced reporting, or dashboards/charts — all explicitly out of scope for this phase.
+- No adjustment/reversal workflow yet for a discrepancy once recorded — a `DailySalesReport`'s variance is calculated and stored permanently, but nothing currently lets an owner act on it beyond seeing it (by design, per the spec: "automatic discrepancy correction" is explicitly excluded from this phase).
+- No pagination on `GET /api/daily-reports` — acceptable at current scale, same reasoning as Phase 2's stock-receipt history.
+- The owner Daily Summary screen shows one business date at a time with no multi-day trend view — intentionally minimal per the spec ("do not build complex charts/analytics yet").

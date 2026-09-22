@@ -41,6 +41,7 @@ export const INVENTORY_TRANSACTION_STATUS_VALUES = Object.values(INVENTORY_TRANS
 export const REFERENCE_TYPES = Object.freeze({
   OPENING_STOCK: 'OPENING_STOCK',
   STOCK_RECEIPT: 'STOCK_RECEIPT',
+  DAILY_SALES_REPORT: 'DAILY_SALES_REPORT',
   SALE_ORDER: 'SALE_ORDER',
   PURCHASE_ORDER: 'PURCHASE_ORDER',
   TRANSFER: 'TRANSFER',
@@ -63,4 +64,14 @@ export const AUDIT_ACTIONS = Object.freeze({
   STOCK_RECEIPT_SUBMITTED: 'STOCK_RECEIPT_SUBMITTED',
   STOCK_RECEIPT_APPROVED: 'STOCK_RECEIPT_APPROVED',
   STOCK_RECEIPT_REJECTED: 'STOCK_RECEIPT_REJECTED',
+  DAILY_SALES_REPORT_SUBMITTED: 'DAILY_SALES_REPORT_SUBMITTED',
 });
+
+// A DailySalesReport is immutable once submitted in Phase 3 — this single
+// status exists so a future reversal/correction workflow has somewhere to
+// record a different state without a schema change.
+export const DAILY_SALES_REPORT_STATUSES = Object.freeze({
+  SUBMITTED: 'SUBMITTED',
+});
+
+export const DAILY_SALES_REPORT_STATUS_VALUES = Object.values(DAILY_SALES_REPORT_STATUSES);

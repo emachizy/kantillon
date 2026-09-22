@@ -222,4 +222,30 @@ describe('POST /api/inventory/opening-stock', () => {
     });
     expect(res.status).toBe(400);
   });
+
+  it('rejects opening-stock initialization once other inventory activity already exists', async () => {
+    const { shop, product, owner } = await setup();
+    const ownerAgent = await loginAgent(app, 'owner@test.dev');
+
+    // Simulate a stock receipt (or any non-opening-stock movement) having
+    // already happened for this shop/product before opening stock is set.
+    await InventoryTransaction.create({
+      shopId: shop._id,
+      productId: product._id,
+      type: 'STOCK_RECEIPT',
+      direction: 'IN',
+      quantity: 50,
+      status: 'APPROVED',
+      createdBy: owner._id,
+      businessDate: '2026-09-01',
+    });
+
+    const res = await ownerAgent.post('/api/inventory/opening-stock').send({
+      shopId: shop._id.toString(),
+      productId: product._id.toString(),
+      quantity: 1000,
+    });
+
+    expect(res.status).toBe(409);
+  });
 });
