@@ -42,6 +42,8 @@ export const REFERENCE_TYPES = Object.freeze({
   OPENING_STOCK: 'OPENING_STOCK',
   STOCK_RECEIPT: 'STOCK_RECEIPT',
   DAILY_SALES_REPORT: 'DAILY_SALES_REPORT',
+  DAILY_REPORT_CORRECTION: 'DAILY_REPORT_CORRECTION',
+  STOCK_VARIANCE_RESOLUTION: 'STOCK_VARIANCE_RESOLUTION',
   SALE_ORDER: 'SALE_ORDER',
   PURCHASE_ORDER: 'PURCHASE_ORDER',
   TRANSFER: 'TRANSFER',
@@ -65,6 +67,13 @@ export const AUDIT_ACTIONS = Object.freeze({
   STOCK_RECEIPT_APPROVED: 'STOCK_RECEIPT_APPROVED',
   STOCK_RECEIPT_REJECTED: 'STOCK_RECEIPT_REJECTED',
   DAILY_SALES_REPORT_SUBMITTED: 'DAILY_SALES_REPORT_SUBMITTED',
+  DAILY_REPORT_CORRECTION_REQUESTED: 'DAILY_REPORT_CORRECTION_REQUESTED',
+  DAILY_REPORT_CORRECTION_APPROVED: 'DAILY_REPORT_CORRECTION_APPROVED',
+  DAILY_REPORT_CORRECTION_REJECTED: 'DAILY_REPORT_CORRECTION_REJECTED',
+  STOCK_VARIANCE_RESOLVED: 'STOCK_VARIANCE_RESOLVED',
+  STOCK_VARIANCE_RESOLUTION_REVERSED: 'STOCK_VARIANCE_RESOLUTION_REVERSED',
+  MONEY_VARIANCE_RESOLVED: 'MONEY_VARIANCE_RESOLVED',
+  MONEY_VARIANCE_RESOLUTION_REVERSED: 'MONEY_VARIANCE_RESOLUTION_REVERSED',
 });
 
 // A DailySalesReport is immutable once submitted in Phase 3 — this single
@@ -75,3 +84,61 @@ export const DAILY_SALES_REPORT_STATUSES = Object.freeze({
 });
 
 export const DAILY_SALES_REPORT_STATUS_VALUES = Object.values(DAILY_SALES_REPORT_STATUSES);
+
+// PROCESSING is an internal workflow-claim state, not a client-facing
+// decision outcome: it exists only for the window between "an owner claimed
+// this request for approval" and "the correction effects were fully built."
+// See services/dailyReportCorrectionService.js approveCorrectionRequest().
+export const CORRECTION_REQUEST_STATUSES = Object.freeze({
+  PENDING: 'PENDING',
+  PROCESSING: 'PROCESSING',
+  APPROVED: 'APPROVED',
+  REJECTED: 'REJECTED',
+});
+
+export const CORRECTION_REQUEST_STATUS_VALUES = Object.values(CORRECTION_REQUEST_STATUSES);
+
+// PROCESSING mirrors the correction-request claim state above: the window
+// between "reservation + resolution record created" and "ledger effect (if
+// any) posted and the resolution marked ACTIVE." See
+// services/stockVarianceResolutionService.js / moneyVarianceResolutionService.js.
+export const VARIANCE_RESOLUTION_STATUSES = Object.freeze({
+  PROCESSING: 'PROCESSING',
+  ACTIVE: 'ACTIVE',
+  REVERSED: 'REVERSED',
+});
+
+export const VARIANCE_RESOLUTION_STATUS_VALUES = Object.values(VARIANCE_RESOLUTION_STATUSES);
+
+export const STOCK_VARIANCE_RESOLUTION_TYPES = Object.freeze({
+  DAMAGE: 'DAMAGE',
+  SHORTAGE: 'SHORTAGE',
+  SURPLUS: 'SURPLUS',
+});
+
+export const STOCK_VARIANCE_RESOLUTION_TYPE_VALUES = Object.values(STOCK_VARIANCE_RESOLUTION_TYPES);
+
+export const MONEY_VARIANCE_RESOLUTION_TYPES = Object.freeze({
+  RECOVERED: 'RECOVERED',
+  ACCEPTED_SHORTAGE: 'ACCEPTED_SHORTAGE',
+  EXPLAINED: 'EXPLAINED',
+  EXCESS_CONFIRMED: 'EXCESS_CONFIRMED',
+  REFUNDED: 'REFUNDED',
+});
+
+export const MONEY_VARIANCE_RESOLUTION_TYPE_VALUES = Object.values(MONEY_VARIANCE_RESOLUTION_TYPES);
+
+// OPENING_STOCK/STOCK_RECEIPT/SURPLUS only ever increase stock; SALE/DAMAGE/
+// SHORTAGE only ever decrease it. REVERSAL is exempt (it must be able to
+// oppose whichever direction it's undoing). TRANSFER_IN/TRANSFER_OUT/
+// ADJUSTMENT are deliberately left unconstrained — TRANSFER isn't
+// implemented yet ("TRANSFER rules remain deferred"), and no service
+// creates ADJUSTMENT transactions in this codebase.
+export const REQUIRED_DIRECTION_BY_TYPE = Object.freeze({
+  OPENING_STOCK: 'IN',
+  STOCK_RECEIPT: 'IN',
+  SURPLUS: 'IN',
+  SALE: 'OUT',
+  DAMAGE: 'OUT',
+  SHORTAGE: 'OUT',
+});

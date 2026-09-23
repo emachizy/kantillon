@@ -135,6 +135,12 @@ const dailySalesReportSchema = new Schema(
   { timestamps: true }
 );
 
+// Genuinely immutable after submission — nothing on this schema is ever
+// updated after creation. Phase 4 variance-resolution "remaining" tracking
+// lives entirely on the separate DailyReportResolutionState coordination
+// document (see that model's comment for why), never here. Do not add a
+// mutable field to this schema without a very strong reason.
+
 // At most one submitted report per shop/product/business-day, enforced at
 // the database level (not just an app-level pre-check) — see
 // dailySalesReportService.js for the concurrent-submission handling this

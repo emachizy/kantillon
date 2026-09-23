@@ -6,6 +6,7 @@ import { PendingApprovalsPage } from './pages/PendingApprovalsPage.jsx';
 import { ReceiptHistoryPage } from './pages/ReceiptHistoryPage.jsx';
 import { DailyReportFormPage } from './pages/DailyReportFormPage.jsx';
 import { DailyReportDetailPage } from './pages/DailyReportDetailPage.jsx';
+import { CorrectionRequestFormPage } from './pages/CorrectionRequestFormPage.jsx';
 import { OwnerDailySummaryPage } from './pages/OwnerDailySummaryPage.jsx';
 import { AppShell } from './components/AppShell.jsx';
 import { ProtectedRoute } from './routes/ProtectedRoute.jsx';
@@ -24,6 +25,7 @@ export default function App() {
             element={<DailyReportFormPage />}
           />
           <Route path="/daily-reports/:id" element={<DailyReportDetailPage />} />
+          <Route path="/daily-reports/:id/request-correction" element={<CorrectionRequestFormPage />} />
           <Route path="/daily-summary" element={<OwnerDailySummaryPage />} />
           <Route path="/approvals" element={<PendingApprovalsPage />} />
           <Route path="/receipts" element={<ReceiptHistoryPage />} />

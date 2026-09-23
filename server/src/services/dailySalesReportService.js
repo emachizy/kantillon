@@ -10,7 +10,7 @@ import {
   getOpeningStockForBusinessDate,
   getApprovedStockReceivedForBusinessDate,
 } from './inventoryService.js';
-import { isFutureBusinessDate } from '../utils/businessDate.js';
+import { isFutureBusinessDate, getLagosBusinessDate } from '../utils/businessDate.js';
 import { runWithOptionalTransaction } from '../utils/transactionRunner.js';
 
 const REPORT_POPULATE = [
@@ -34,6 +34,39 @@ export async function getLatestClosedBusinessDate(shopId, productId) {
 export async function hasPendingReceiptForBusinessDate(shopId, productId, businessDate) {
   const exists = await StockReceipt.exists({ shopId, productId, businessDate, status: 'PENDING' });
   return Boolean(exists);
+}
+
+// Where should a post-close owner adjustment (stock variance resolution)
+// actually be dated? See README "Posting business-date rules" for the full
+// worked reasoning; summary:
+//
+// CASE A — no later DailySalesReport exists after sourceBusinessDate: post
+// on sourceBusinessDate itself. This is an explicit, report-tied owner
+// adjustment, not a hidden receipt/sale mutation, and nothing later depends
+// on that date's totals yet, so there's nothing to silently rewrite.
+//
+// CASE B — a later report already exists: posting on sourceBusinessDate
+// would retroactively change the approved-stock-received/opening-stock
+// inputs that later report already used and stored, so it's forbidden.
+// Instead post on today's Africa/Lagos date — but ONLY if today itself
+// isn't already closed by a report for this shop/product, since that would
+// have the identical problem one day later.
+export async function resolvePostingBusinessDate(shopId, productId, sourceBusinessDate) {
+  const latestClosed = await getLatestClosedBusinessDate(shopId, productId);
+
+  if (!latestClosed || latestClosed <= sourceBusinessDate) {
+    return sourceBusinessDate;
+  }
+
+  const today = getLagosBusinessDate();
+  const closedToday = await DailySalesReport.exists({ shopId, productId, businessDate: today });
+  if (closedToday) {
+    throw ApiError.conflict(
+      `Business date ${today} is already closed for this shop/product; the adjustment cannot be ` +
+        'inserted into an already-closed sequence'
+    );
+  }
+  return today;
 }
 
 export async function submitDailySalesReport({

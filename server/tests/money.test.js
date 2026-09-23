@@ -4,6 +4,7 @@ import { nairaToKobo, koboToNairaString, isSafeMoneyInteger } from '../src/utils
 describe('money utilities (integer kobo, no floating-point Naira math)', () => {
   it('converts whole Naira amounts to kobo', () => {
     expect(nairaToKobo(12000)).toBe(1200000);
+    expect(nairaToKobo('12000')).toBe(1200000);
     expect(nairaToKobo('12500')).toBe(1250000);
   });
 
@@ -11,13 +12,31 @@ describe('money utilities (integer kobo, no floating-point Naira math)', () => {
     // A naive parseFloat('12.15') * 100 can yield 1214.9999999999998 in
     // IEEE-754 floating point — this must not happen here.
     expect(nairaToKobo('12.15')).toBe(1215);
+    expect(nairaToKobo('12000.50')).toBe(1200050);
     expect(nairaToKobo('0.1')).toBe(10);
     expect(nairaToKobo('0.01')).toBe(1);
   });
 
+  it('rejects Naira input with more than 2 decimal places', () => {
+    expect(() => nairaToKobo('12.999')).toThrow();
+    expect(() => nairaToKobo('0.001')).toThrow();
+  });
+
   it('rejects malformed Naira input rather than silently coercing it', () => {
     expect(() => nairaToKobo('not-a-number')).toThrow();
-    expect(() => nairaToKobo('12.999')).toThrow();
+    expect(() => nairaToKobo('')).toThrow();
+    expect(() => nairaToKobo('12,000')).toThrow();
+    expect(() => nairaToKobo('₦12000')).toThrow();
+  });
+
+  it('rejects negative amounts as money via isSafeMoneyInteger (the validator every money field uses)', () => {
+    // nairaToKobo itself is sign-preserving (a generic converter — see its
+    // own doc comment), but every real money field (unitPriceKobo,
+    // actualAmountCollectedKobo, priceKobo, ...) is validated with
+    // isSafeMoneyInteger, which rejects negative values outright.
+    expect(nairaToKobo('-100')).toBe(-10000);
+    expect(isSafeMoneyInteger(nairaToKobo('-100'))).toBe(false);
+    expect(isSafeMoneyInteger(-1)).toBe(false);
   });
 
   it('round-trips kobo back to a Naira decimal string', () => {

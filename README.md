@@ -2,7 +2,7 @@
 
 A multi-shop cement inventory, sales, and reconciliation system for a business owner running several independent shops.
 
-> **Phase 1 + 2 + 3 scope.** Phase 1 built the project foundation. Phase 2 added opening-stock initialization, staff-submitted stock receipts, owner approval/rejection, and ledger-derived inventory balances. Phase 3 (this phase) adds the daily end-of-day workflow: staff report bags sold, physical closing stock, and money collected; the backend calculates expected stock, expected revenue, stock variance, and money variance, and books an immediate `SALE` ledger transaction. Credit sales, expenses, payroll, stock transfers, advanced reporting, stock adjustments, and automatic discrepancy correction are **not** implemented yet — they are later phases.
+> **Phase 1 + 2 + 3 + 4 scope.** Phase 1 built the project foundation. Phase 2 added opening-stock initialization, staff-submitted stock receipts, and owner approval/rejection. Phase 3 added the daily end-of-day workflow (sales lines, expected stock, expected revenue, stock/money variance) with an immediate `SALE` ledger transaction. Phase 4 (this phase) adds two deliberately separate concepts: **corrections** (fixing a data-entry mistake in an already-submitted report, via an immutable correction snapshot and reversal/replacement ledger transactions) and **discrepancy resolution** (recording a genuine real-world stock or money discrepancy — damage, shortage, surplus, a cash shortfall — against an *accurate* report, via owner-posted resolution records). Credit sales, customer accounts receivable, expenses, payroll, bank reconciliation, stock transfers, purchase orders, general-ledger accounting, and advanced analytics are **not** implemented yet — they are later phases.
 
 ## Project purpose
 
@@ -200,7 +200,135 @@ Same conservative stance as Phase 2: `ADMIN` gets no new write capability here e
 
 ### What Phase 3 still doesn't do
 
-No credit sales, expenses, payroll, stock transfers, advanced reporting, or automatic stock/money adjustment — all explicitly out of scope. No adjustment/reversal workflow yet (a discrepancy is recorded, never auto-corrected); that's an explicit future phase, as the spec requires.
+No credit sales, expenses, payroll, stock transfers, advanced reporting, or automatic stock/money adjustment — all explicitly out of scope. No adjustment/reversal workflow yet (a discrepancy is recorded, never auto-corrected); that's an explicit future phase, as the spec requires. **Phase 4 (below) is that adjustment/reversal workflow.**
+
+## Phase 4: corrections & discrepancy resolution
+
+Phase 4 introduces two **deliberately separate** concepts that must never substitute for each other:
+
+- **Correction** — "the salesperson entered the wrong information." A data-entry mistake in an already-submitted report. Fixed by requesting and approving a correction, which produces an immutable new snapshot and, if the sold quantity changed, a reversal + replacement ledger effect. The original report and its original `SALE` transaction are never edited or deleted.
+- **Discrepancy resolution** — "the report was accurate, but a real shortage/surplus/damage happened." The report stays exactly as submitted; the owner posts an explicit ledger adjustment (`DAMAGE`/`SHORTAGE`/`SURPLUS`) that brings official stock in line with reality, or a money-variance resolution record (no ledger effect) explaining a cash discrepancy.
+
+**Never use one to hide the other.** A stock adjustment must never be used to paper over an incorrect report, and a report correction must never be used to make a real shortage disappear — which is exactly why Phase 4 blocks a new correction once any active variance resolution exists against the report (see "Correction ↔ resolution blocking" below).
+
+### Immutable report architecture
+
+Nothing about Phase 1–3's immutability guarantees changes: a submitted `DailySalesReport` still has no edit/delete endpoint, and an `APPROVED` `InventoryTransaction` is still never mutated. Phase 4 adds three new collections, all governed by the same rule — **create new immutable records, never rewrite old ones**:
+
+- `DailyReportCorrectionRequest` — a staff-submitted proposal (PENDING/APPROVED/REJECTED). Never edited after creation; approval/rejection are terminal status transitions on this one document, not edits to its proposed content.
+- `DailySalesCorrection` — an approved correction **snapshot**, created once and never touched again. A second correction creates a *new* `DailySalesCorrection` (`correctionNumber` 2, 3, ...) rather than editing the first.
+- `StockVarianceResolution` / `MoneyVarianceResolution` — owner-posted discrepancy records. Never edited; a mistake is undone via `/reverse`, which marks the record `REVERSED` and (for stock) posts an opposing ledger transaction — the original resolution row still exists, permanently, as part of the history.
+
+### Effective-report concept
+
+"What is the corrected version of this report, right now?" is answered by one reusable service function, `dailyReportCorrectionService.getEffectiveDailyReport(reportId)` (exposed as `GET /api/daily-reports/:id/effective`), never duplicated in a controller:
+
+- **effective** = the latest **approved** `DailySalesCorrection` for the report, or the original report itself if none exists yet.
+- A **rejected** correction request never produces a `DailySalesCorrection` at all — so it can never become effective, by construction, not by an extra filter.
+- The **original** report is always still separately queryable (`GET /api/daily-reports/:id` — unchanged from Phase 3) and its own stored numbers never change, no matter how many corrections happen later. The owner summary and history list display *original* stored values (Phase 3 behavior, unchanged); the dedicated `/effective` endpoint is what the UI uses whenever it needs the corrected numbers, and the frontend shows a **"Corrected"** badge whenever `isCorrected` is true rather than silently presenting corrected numbers as if nothing happened.
+
+### Correction request workflow
+
+- `POST /api/daily-reports/:id/corrections` — **OWNER, MANAGER, SALESPERSON** (not `ADMIN`) for a shop they can access. The body is the **complete proposed corrected state** (sales lines, physical closing stock, actual amount collected, notes, and a required `reason`) — never a partial patch, so review is unambiguous.
+- Only **one PENDING request per report at a time**, enforced by a partial unique index on `{dailySalesReportId}` where `status: "PENDING"` — not just an app-level check.
+- Every server-calculated field on `DailySalesReport` (`expectedRevenueKobo`, `stockVarianceQuantity`, `status`, `submittedBy`, ...) has no equivalent field on the request schema at all — sending one does nothing; it's silently stripped by Zod before the controller sees it.
+- `GET /api/daily-reports/:id/corrections` — full request history (all statuses) for a report, shop-scoped the same way the report itself is.
+- `GET /api/correction-requests/pending` — **OWNER only**, across all shops.
+
+### Correction approval / rejection
+
+- `POST /api/correction-requests/:id/approve` and `.../reject` — **OWNER only**. Rejection requires a `reason`; an already-approved or already-rejected request returns `409` on either action.
+- Approval is gated by the same atomic-conditional-update pattern as every other approval in this codebase: `findOneAndUpdate({ _id, status: 'PENDING' }, { status: 'APPROVED', ... })`. Exactly one concurrent approval attempt can win — verified with a real concurrent-request test (two simultaneous approvals, exactly one `200` and one `409`, exactly one `DailySalesCorrection` created).
+- **What "approve" actually means the request stays honest about**: the atomic flip happens *first* (that's the concurrency guarantee), and only then does the service compute the corrected snapshot and post any ledger effects. If that second part fails for any reason, the request is reverted back to `PENDING` (not left falsely `APPROVED` with nothing behind it) and the failure is logged loudly — see "Concurrency & compensation" below.
+- The historical base for every calculation (`openingStockQuantity`, `approvedStockReceivedQuantity`, `availableStockQuantity`) is always read from the **original** `DailySalesReport`, never recalculated from today's ledger — this is what makes "correction of a correction" (below) still get history right.
+
+### Reversal/replacement ledger behavior
+
+If the corrected total quantity sold **differs** from whatever is currently effective, the old `SALE` is never edited — a `REVERSAL` (opposing direction, opposing the *currently effective* sale) is posted, then a new `SALE` with the corrected quantity:
+
+```
+Original:            SALE  OUT 400
+Correction to 390:    REVERSAL  IN  400   (opposes the sale it reverses — referenceId points to it)
+                       SALE     OUT 390   (referenceId points to the new DailySalesCorrection)
+Net ledger effect:  -390
+```
+
+Verified live end-to-end and by test: after this, `GET /api/inventory/shop/:shopId` reflects the ledger correctly, the **original** `SALE OUT 400` transaction is still fully queryable and unmodified, and the **original** `DailySalesReport` still reports `totalQuantitySold: 400` (its own immutable field). `DailySalesCorrection.reversalInventoryTransactionId` / `.replacementSaleInventoryTransactionId` record both new transactions; `.effectiveSaleInventoryTransactionId` always points at whichever `SALE` is now the source of truth for this report's inventory effect.
+
+**If the quantity is unchanged** — only price lines, physical count, actual collected, or notes differ — **no reversal/replacement is created**. The existing effective `SALE` transaction remains the inventory effect; only the `DailySalesCorrection` snapshot changes for revenue/reconciliation display. Verified by three separate tests (price-only, physical-only, money-only corrections all produce zero new `InventoryTransaction` documents).
+
+### Correction-of-correction behavior
+
+A later correction always reverses whatever is **currently effective**, not the original, however many corrections deep:
+
+```
+Original:      400 sold  (SALE OUT 400)
+Correction #1: 390 sold  → REVERSAL IN 400, SALE OUT 390   (effective is now 390)
+Correction #2: 395 sold  → REVERSAL IN 390, SALE OUT 395   (reverses #1's effective sale, not the original 400)
+Net ledger effect: -395
+```
+
+`DailySalesCorrection.supersedesCorrectionId` links each correction to the one before it, so the full chain — original report, `SALE OUT 400`, Correction #1's `REVERSAL`/`SALE`, Correction #2's `REVERSAL`/`SALE` — remains completely visible and queryable, permanently.
+
+### Correction ↔ resolution blocking
+
+Once **any** `ACTIVE` stock or money variance resolution exists against a report, a **new correction request is rejected with `409`** — otherwise a resolution could end up describing numbers a correction just made obsolete. The message explains that the resolution(s) must be reversed first. Symmetrically, this is re-checked again at *approval* time (not just request time), in case a resolution was posted while the request sat pending — if so, the approval itself is refused with `409` rather than silently approving into an inconsistent state.
+
+### Stock variance resolution
+
+`POST /api/daily-reports/:id/stock-variance-resolutions` — **OWNER only**. The resolution type must match the **effective** variance's sign — `DAMAGE`/`SHORTAGE` only against a negative (shortage) variance, `SURPLUS` only against a positive (surplus) one; the wrong combination is rejected with `400`. A zero-variance report has nothing to resolve (`409`).
+
+Each `ACTIVE` resolution immediately posts exactly one `APPROVED` `InventoryTransaction` (`DAMAGE`/`SHORTAGE` → `OUT`, `SURPLUS` → `IN`), so official stock catches up with reality — verified against the spec's worked example end-to-end:
+
+```
+Daily report:  expected closing 1100, physical 1097, variance -3
+Owner resolves DAMAGE 2   → DAMAGE OUT 2  → official stock 1098, remaining variance -1
+Owner resolves SHORTAGE 1 → SHORTAGE OUT 1 → official stock 1097, remaining variance 0
+The DailySalesReport itself still shows: expected 1100, physical 1097, variance -3 (unchanged, forever).
+```
+
+**Partial resolution** is fully supported — the remaining unresolved magnitude is always server-derived (`ABS(effectiveVariance) − SUM(active resolution quantities)`, sign preserved), never trusted from the frontend.
+
+### Posting business-date rules
+
+A resolution's ledger transaction needs its own `businessDate`, computed by the reusable `dailySalesReportService.resolvePostingBusinessDate()`:
+
+- **No later report exists** for this shop/product after the source report's date → post on the **source business date itself**. This is an explicit, report-tied owner adjustment, not a hidden mutation — nothing later has used that date's totals yet, so there's nothing to silently rewrite.
+- **A later report already exists** → posting on the source date would retroactively sit "before" numbers that later report already computed and stored, so instead post on **today's** Africa/Lagos date — but only if today itself isn't already closed by a report for this shop/product (if it is, `409`: "cannot be inserted into an already-closed sequence").
+
+### effectKey idempotency
+
+`InventoryTransaction.effectKey` is a sparse, unique string set only by Phase 4 workflow-driven ledger effects (`daily-correction:<correctionRequestId>:reversal`, `...:replacement-sale`, `stock-resolution:<resolutionId>:adjustment`, `...:reversal`). A duplicate `effectKey` insert fails at the database level (tested directly) — this is a defense-in-depth idempotency backstop for these specific, identifiably-keyed ledger effects, layered on top of (not instead of) the atomic conditional updates that are the actual primary correctness guarantee. Phase 1–3 transactions never set this field and are entirely unaffected (sparse index).
+
+### Inventory type/direction invariants
+
+A document-level validator (`InventoryTransaction.pre('validate')`) now enforces: `OPENING_STOCK`/`STOCK_RECEIPT`/`SURPLUS` must be `IN`; `SALE`/`DAMAGE`/`SHORTAGE` must be `OUT`; `REVERSAL` is exempt (it must be able to oppose either direction). `TRANSFER_IN`/`TRANSFER_OUT`/`ADJUSTMENT` are deliberately left unconstrained — transfers aren't implemented yet and nothing creates an `ADJUSTMENT` row in this codebase. Every legitimate historical combination from Phases 1–3 still validates; every invalid one (`SALE`+`IN`, `STOCK_RECEIPT`+`OUT`, etc.) is now rejected and tested.
+
+### Money variance resolution
+
+`POST /api/daily-reports/:id/money-variance-resolutions` — **OWNER only**. This is an **accountability record, not a cash ledger** — it **never** creates an `InventoryTransaction`. Same partial-resolution and remaining-amount math as stock resolution, in integer kobo throughout (no floating-point):
+
+```
+Effective money variance: -₦25,000 (-2,500,000 kobo)
+RECOVERED ₦10,000        → remaining -₦15,000
+ACCEPTED_SHORTAGE ₦15,000 → remaining ₦0
+```
+
+For a positive (excess) variance, `EXCESS_CONFIRMED`/`REFUNDED`/`EXPLAINED` are the available types. A zero-variance report rejects any resolution attempt (`409`); an amount exceeding the remaining unresolved magnitude also rejects (`409`).
+
+### Reversing a resolution
+
+`POST /api/stock-variance-resolutions/:id/reverse` and `POST /api/money-variance-resolutions/:id/reverse` — **OWNER only**, both require a `reason`. Neither deletes nor edits the original resolution — it's marked `REVERSED` (permanently visible in history) and, for a stock resolution, an opposing `REVERSAL` `InventoryTransaction` is posted (a reversed `SHORTAGE OUT 1` becomes `REVERSAL IN 1`; a reversed `SURPLUS IN 2` becomes `REVERSAL OUT 2`). A `REVERSED` resolution no longer counts toward resolved variance, and the same resolution can never be reversed twice (`409`, atomically gated the same way approve/reject is).
+
+### Concurrency & compensation strategy (Phase 4)
+
+Same honesty about standalone MongoDB as every earlier phase — this environment's local MongoDB is confirmed standalone (no replica set), so real multi-document transactions aren't available, and this codebase doesn't pretend otherwise. Three genuinely different concurrency problems, three different (matched-to-the-problem) solutions:
+
+1. **Double-approval / double-reversal** (a request racing another identical request) — the existing atomic conditional-update pattern (`findOneAndUpdate` gated on current status) is sufficient and needs no transaction. Verified with real concurrent-request tests for correction approval and for both resolution-reversal endpoints.
+2. **Over-resolution** (two concurrent resolution requests that individually fit but together would exceed the remaining variance) — this is the one genuinely new problem Phase 4 introduces, and it's solved with an **atomic reservation**: `DailySalesReport.resolvedStockVarianceMagnitude` / `.resolvedMoneyVarianceMagnitudeKobo` are incremented via a single `findOneAndUpdate` whose filter includes `$expr: { $lte: [...] }` checking the *post-increment* total against the variance's magnitude — the increment and the bound-check happen in one atomic single-document operation, so the second of two concurrent requests simply fails to match once the first has already raised the counter. No read-then-write race window, no optimistic-retry loop needed, and it never trusts a client-supplied "remaining" number. Verified directly: two concurrent resolution requests that would individually fit but together exceed the variance — exactly one succeeds. This counter deliberately lives on the report itself rather than per-correction, which is safe specifically *because* a correction is blocked while any resolution is active — at most one "resolution period" is ever open per report at a time, regardless of which version is effective.
+3. **Correction compensation** (the one genuine multi-document *create*: `DailySalesCorrection` + optional `REVERSAL` + optional replacement `SALE`) — reuses the exact Phase 2/3 `transactionRunner.js` pattern: attempt a real session transaction, fall back to sequential writes with compensating cleanup on this standalone instance. Uniquely for Phase 4, if the ledger-effect creation fails *after* the correction request was already atomically flipped to `APPROVED`, the request is explicitly reverted back to `PENDING` (logged under `[DAILY_CORRECTION_PARTIAL_FAILURE]`) so it never sits permanently `APPROVED` with nothing behind it — verified with a forced-failure test.
+
+Where a resolution's own ledger transaction creation fails after its atomic reservation succeeded, the reservation is explicitly given back (`$inc` the negative amount) before surfacing the error — verified with a forced-failure test for both stock and money resolutions.
 
 ## Folder structure
 
@@ -212,14 +340,18 @@ server/
     middleware/   auth, validation, error handling, rate limiting
     models/       Mongoose schemas (User, Shop, Product, ShopPrice,
                    InventoryTransaction, AuditLog, StockReceipt,
-                   DailySalesReport)
+                   DailySalesReport, DailyReportCorrectionRequest,
+                   DailySalesCorrection, StockVarianceResolution,
+                   MoneyVarianceResolution)
     routes/       Express routers
     services/     business logic (auth, users, shop access, inventory
                    balances, opening stock, stock receipts, daily sales
-                   reports, shop prices, audit)
+                   reports, shop prices, audit, report corrections, stock
+                   variance resolution, money variance resolution)
     utils/        constants, ApiError, response helpers, JWT/cookie helpers,
                    optional-transaction runner, money (integer kobo),
-                   businessDate (Africa/Lagos)
+                   businessDate (Africa/Lagos), variance (remaining-magnitude
+                   math)
     validators/   Zod schemas
     seed/         development seed script
     migrations/   idempotent, additive data migrations (see "Tests" below
@@ -229,14 +361,17 @@ server/
 client/
   src/
     api/          Axios client + typed request helpers (auth, shops,
-                   inventory, stock receipts, daily reports, shop prices)
+                   inventory, stock receipts, daily reports, shop prices,
+                   corrections, variance resolutions)
     context/      AuthContext (session state via TanStack Query)
     routes/       ProtectedRoute
     utils/        money (Naira <-> kobo), businessDate (Africa/Lagos)
     pages/        LoginPage, HomePage (role-branches to Owner/Staff home),
-                   ShopInventoryPage, PendingApprovalsPage, ReceiptHistoryPage,
-                   DailyReportFormPage, DailyReportDetailPage,
-                   OwnerDailySummaryPage
+                   ShopInventoryPage, PendingApprovalsPage (stock receipts +
+                   correction requests), ReceiptHistoryPage,
+                   DailyReportFormPage, DailyReportDetailPage (effective
+                   values, variance resolution, correction history),
+                   CorrectionRequestFormPage, OwnerDailySummaryPage
     components/   AppShell (mobile-first top bar + bottom tab nav)
 ```
 
@@ -354,7 +489,7 @@ Tests run against a real local MongoDB database (`kantillon_test` by default, ov
 
 **Test database safety guard.** Every destructive test operation (`deleteMany`, `dropDatabase` in `tests/testDb.js`) is gated by `assertSafeTestDatabase()`, which fails closed: it throws unless `NODE_ENV` is exactly `"test"` **and** the actually-connected database name (checked on the live connection, not the configured URI string) is exactly `kantillon_test`. This is verified by `tests/testDbSafety.test.js` and was manually confirmed to block real attempts to run against `NODE_ENV=development` and against a `MONGO_TEST_URI` pointed at `kantillon_dev` — both refused before touching any data. The auth rate limiter is skipped only under `NODE_ENV=test` (`middleware/rateLimiters.js`), since the suite logs in far more often per minute than any real client (each test needs a fresh user after `clearTestDb`); this never applies outside test.
 
-**124 tests across 11 files**, including (Phase 1, preserved unchanged):
+**212 tests across 15 files**, including (Phase 1, preserved unchanged):
 - Login succeeds with valid credentials and sets an httpOnly cookie / fails with invalid credentials / rejects a deactivated user
 - Unauthenticated requests are rejected on protected routes
 - `passwordHash` is never present in any API response
@@ -389,6 +524,26 @@ Phase 3 additions (65 new tests across `dailySalesReport.test.js`, `money.test.j
 
 Also verified live against a running server (not just automated tests): the full opening-stock → receipt → approval → daily-report → inventory-check → owner-summary flow reproduces the spec's worked example exactly, and changing a shop's active price after submission leaves the saved report's `unitPriceKobo`/`expectedRevenueKobo` untouched.
 
+Phase 4 additions (82 new tests across `dailyReportCorrection.test.js`, `stockVarianceResolution.test.js`, `moneyVarianceResolution.test.js`, `inventoryTransactionInvariants.test.js`):
+- Correction requests: assigned salesperson/manager can request, unauthorized shop and ADMIN both rejected (403), only one pending request at a time (409), reason required, proposed values validated the same way report submission is, calculated fields cannot be spoofed
+- Correction approval/rejection: OWNER-only (non-owner 403), rejection requires a reason, already-approved/already-rejected transitions both return 409, a genuine concurrent double-approval test confirms exactly one winner
+- Corrected calculations: quantity/price/collection/physical-count changes each recalculate the right derived field, historical opening/received quantities never change, a correction exceeding historical available stock is rejected (409)
+- Ledger correction: a quantity change creates a `REVERSAL` opposing the *effective* sale plus a replacement `SALE` with the corrected quantity (both verified end-to-end against the exact spec worked example, including the resulting ledger balance), the original `SALE` and original report remain fully queryable and unchanged, and three separate tests confirm a same-quantity (price-only / physical-only / money-only) correction creates zero new ledger transactions
+- Correction of a correction: a second quantity correction reverses the current effective sale (not the original), `supersedesCorrectionId` links the chain, and full correction history remains queryable
+- Effective report: no correction ⇒ original is effective; an approved correction ⇒ it becomes effective; a rejected correction never becomes effective; the owner summary still shows original values while `/effective` shows corrected ones
+- Correction ↔ resolution blocking: an active stock or money variance resolution blocks a new correction request (409) in both directions
+- Correction compensation: a forced replacement-SALE failure leaves no orphaned correction/reversal and reverts the request back to `PENDING` rather than leaving it falsely `APPROVED`
+- Correction audit: request/approval/rejection each create their own audit entry
+- Correction authorization/history: staff see correction history only for their assigned shop; the effective-report endpoint is shop-scoped
+- Stock variance resolution: `DAMAGE`/`SHORTAGE` accepted only against negative variance, `SURPLUS` only against positive (wrong combination rejected 400), zero variance rejects any resolution (409), the exact spec worked example (`DAMAGE 2` then `SHORTAGE 1` fully resolving `-3`) verified end-to-end including official balance at each step and the original report's variance staying unchanged, over-resolution rejected (409), OWNER-only creation, correct transaction type/direction per resolution type, audit entry created, and a genuine concurrent test proving two requests that would individually fit but together exceed the variance cannot both succeed
+- Stock resolution reversal: posts an opposing `REVERSAL` transaction and reopens the variance, cannot reverse twice (409), non-owner cannot reverse (403), reversing a nonexistent resolution returns 404, audit entry created, a genuine concurrent double-reversal test confirms exactly one winner
+- Stock resolution compensation: a forced ledger-transaction failure leaves no valid-looking resolution and gives back the reservation
+- Money variance resolution: partial resolution for both negative and positive variance, zero variance and over-resolution both rejected (409), creates **zero** `InventoryTransaction` documents, safe-integer kobo preserved exactly, OWNER-only, audit entry created, a genuine concurrent over-resolution test
+- Money resolution reversal: reopens the remaining amount with no `InventoryTransaction` involved, cannot reverse twice (409), reversing a nonexistent resolution returns 404, audit entry created
+- Money resolution compensation: a forced write failure gives back the reservation and leaves no orphaned resolution
+- Inventory type/direction invariants: every invalid combination (`SALE`+`IN`, `STOCK_RECEIPT`+`OUT`, `OPENING_STOCK`+`OUT`, `DAMAGE`/`SHORTAGE`+`IN`, `SURPLUS`+`OUT`) rejected; `REVERSAL` allowed in both directions; every legitimate historical combination still validates
+- `effectKey` idempotency: a duplicate `effectKey` is rejected at the database level; documents with no `effectKey` (the Phase 1–3 norm) are unaffected by the sparse unique index
+
 ## API surface
 
 **Phase 1:**
@@ -403,6 +558,25 @@ Also verified live against a running server (not just automated tests): the full
 
 **Phase 3:** see "API endpoints" under "Phase 3: daily sales & reconciliation" above (`/api/daily-reports` and its sub-routes, `/api/shop-prices/.../current`).
 
+**Phase 4:**
+
+| Endpoint | Access |
+| --- | --- |
+| `POST /api/daily-reports/:id/corrections` | OWNER, MANAGER, SALESPERSON (shop-scoped). Not ADMIN |
+| `GET /api/daily-reports/:id/corrections` | Shop-scoped (same rule as the report itself) |
+| `GET /api/correction-requests/pending` | OWNER only |
+| `POST /api/correction-requests/:id/approve` | OWNER only |
+| `POST /api/correction-requests/:id/reject` | OWNER only |
+| `GET /api/daily-reports/:id/effective` | Shop-scoped |
+| `POST /api/daily-reports/:id/stock-variance-resolutions` | OWNER only |
+| `GET /api/daily-reports/:id/stock-variance-resolutions` | Shop-scoped |
+| `POST /api/stock-variance-resolutions/:id/reverse` | OWNER only |
+| `POST /api/daily-reports/:id/money-variance-resolutions` | OWNER only |
+| `GET /api/daily-reports/:id/money-variance-resolutions` | Shop-scoped |
+| `POST /api/money-variance-resolutions/:id/reverse` | OWNER only |
+
+No edit or delete endpoint exists for any Phase 4 resource — corrections and resolutions are append-only by design (see "Immutable report architecture" above).
+
 ## Frontend (mobile-first)
 
 - **OWNER** sees a Home screen listing every shop with its current balance and a pending-approvals count; tapping a shop opens its inventory, where any uninitialized product shows an "Initialize opening stock" form; a bottom-nav "Approvals" tab lists every pending receipt with Approve / Reject (reason required) actions; a "Daily Summary" tab lets the owner pick a business date and see every submitted shop/product report as a card (bags sold, expected/physical closing, stock status, expected/collected revenue, money status — shortage/surplus stated in text, never color alone), tappable through to the full report detail.
@@ -410,6 +584,7 @@ Also verified live against a running server (not just automated tests): the full
 - All server state is fetched via TanStack Query; every mutation (opening stock, submit/approve/reject, daily report submission) invalidates the relevant `inventory`, `stockReceipts`, and `dailyReports` query keys so balances and lists refetch automatically. Every page has explicit loading, error (including a distinct message for `403`), and success states.
 - Money is entered and displayed in Naira but converted to/from integer kobo via `utils/money.js` (string-based, not `parseFloat(x) * 100`) before ever reaching the API.
 - Frontend role checks (e.g. hiding the opening-stock form from non-owners, hiding "Daily Summary" from non-owners) are UX only — every rule is re-enforced server-side, and was verified live: a salesperson hitting the owner-only approve endpoint gets `403`, and a salesperson cannot read another shop's inventory by editing the URL.
+- **Phase 4:** the Daily Report detail page (`DailyReportDetailPage`) is now the hub for a report — it fetches the **effective** version (via `/effective`, not the raw original) and shows a "Corrected" badge whenever a correction is effective, with a link through to the correction history. It always shows the resolved/remaining stock and money variance, sourced from the server, never computed client-side. **Any authorized user** with no active resolution blocking it sees a "Request Correction" link (`CorrectionRequestFormPage`, prefilled with the current effective values and a Current → Proposed comparison before submit). **OWNER only** sees "Resolve Stock Variance" / "Resolve Money Variance" forms (hidden entirely for non-owners) plus reversal controls on each active resolution row (an inline reason input, not a native browser dialog). Pending correction requests are surfaced on the existing `PendingApprovalsPage` alongside pending stock receipts, with the same Approve/Reject-with-reason pattern.
 
 ## Assumptions made in Phase 1
 
@@ -453,3 +628,18 @@ Also verified live against a running server (not just automated tests): the full
 - No adjustment/reversal workflow yet for a discrepancy once recorded — a `DailySalesReport`'s variance is calculated and stored permanently, but nothing currently lets an owner act on it beyond seeing it (by design, per the spec: "automatic discrepancy correction" is explicitly excluded from this phase).
 - No pagination on `GET /api/daily-reports` — acceptable at current scale, same reasoning as Phase 2's stock-receipt history.
 - The owner Daily Summary screen shows one business date at a time with no multi-day trend view — intentionally minimal per the spec ("do not build complex charts/analytics yet").
+
+## Assumptions made in Phase 4
+
+- Correction ledger effects (`REVERSAL`/replacement `SALE`) are always dated with the **original report's** `businessDate`, not `resolvePostingBusinessDate()`'s CASE A/B logic — that logic is specific to stock variance resolution (the spec titles it "stock resolution posting date"). This is safe because a report's stored inventory-context fields (`openingStockQuantity`, etc.) are frozen at submission time, never live-recalculated — so a backdated ledger entry can't retroactively corrupt an already-submitted later report; it only (correctly) affects the always-live overall balance and any *future* date-scoped calculation.
+- The two resolution "resolved magnitude" counters (`resolvedStockVarianceMagnitude`, `resolvedMoneyVarianceMagnitudeKobo`) live on `DailySalesReport` itself rather than per-`DailySalesCorrection` — safe specifically because a correction is blocked while either counter is non-zero, so at most one "resolution period" is ever open per report regardless of which version is currently effective. This is the one field Phase 4 makes mutable on an otherwise-immutable document; it's updated exclusively via atomic conditional increments from the two resolution services, never through a generic edit endpoint (none exists).
+- A correction-approval failure (after the atomic `PENDING`→`APPROVED` flip but before the ledger effects are successfully created) reverts the request back to `PENDING` rather than introducing a new terminal status — the spec's request model only defines `PENDING`/`APPROVED`/`REJECTED`, and "the approval attempt didn't take effect, try again" is the most accurate description of that state.
+- `GET .../stock-variance-resolutions` and `GET .../money-variance-resolutions` have no role restriction beyond shop access (any authorized viewer, including staff, can see resolution history) — only *creating* or *reversing* a resolution is OWNER-only. The spec's frontend section shows resolution history on the owner screen but never says staff must be blocked from seeing it, and Phase 2/3 already established "reads are shop-scoped, writes are role-gated" as the default pattern.
+- No new data migration was needed for Phase 4's schema additions (`InventoryTransaction.effectKey`, `DailySalesReport`'s two resolution counters) — both are optional/defaulted fields, and Mongoose applies schema defaults at read time even for pre-existing documents that predate the field, so no backfill script was required (unlike Phase 3's `businessDate`/`priceKobo`, which were `required: true`).
+
+## Known Phase 4 gaps (by design — later phases)
+
+- No credit sales, customer accounts receivable, expenses, payroll, bank reconciliation, stock transfers, purchase orders, general-ledger accounting, or advanced analytics — all explicitly out of scope for this phase.
+- No UI for browsing all `StockVarianceResolution`/`MoneyVarianceResolution` records across shops (only per-report history) — acceptable at current scale; a cross-shop discrepancy log is a natural later-phase addition.
+- No pagination on any Phase 4 list endpoint — same reasoning as Phase 2/3's history endpoints.
+- Once a correction is blocked by an active resolution, there's no dedicated endpoint to list *why* beyond the resolution history already visible on the report detail page — acceptable since that history is already the full explanation.

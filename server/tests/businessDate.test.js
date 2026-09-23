@@ -78,6 +78,49 @@ describe('business-date / money migration idempotency', () => {
     expect(afterSecond.priceKobo).toBe(75000);
   });
 
+  it('converts a fractional legacy Naira price without floating-point drift', async () => {
+    const collection = mongoose.connection.collection('shopprices');
+    const { insertedId } = await collection.insertOne({
+      shopId: new mongoose.Types.ObjectId(),
+      productId: new mongoose.Types.ObjectId(),
+      price: 750.5,
+      effectiveFrom: new Date(),
+      effectiveTo: null,
+      changedBy: new mongoose.Types.ObjectId(),
+    });
+
+    const result = await migrateShopPricePriceToKobo();
+    expect(result.migrated).toBe(1);
+
+    const migrated = await collection.findOne({ _id: insertedId });
+    // 750.5 Naira = 75050 kobo exactly — a naive 750.5 * 100 float
+    // multiplication can already drift for some values; the migration goes
+    // through nairaToKobo's string-based conversion specifically to avoid it.
+    expect(migrated.priceKobo).toBe(75050);
+    expect(migrated.price).toBeUndefined();
+  });
+
+  it('leaves an already-migrated row (no legacy price field) completely untouched', async () => {
+    const collection = mongoose.connection.collection('shopprices');
+    const fixedDate = new Date('2026-01-01T00:00:00Z');
+    const { insertedId } = await collection.insertOne({
+      shopId: new mongoose.Types.ObjectId(),
+      productId: new mongoose.Types.ObjectId(),
+      priceKobo: 123456,
+      effectiveFrom: fixedDate,
+      effectiveTo: null,
+      changedBy: new mongoose.Types.ObjectId(),
+    });
+
+    const result = await migrateShopPricePriceToKobo();
+    expect(result.migrated).toBe(0);
+
+    const untouched = await collection.findOne({ _id: insertedId });
+    expect(untouched.priceKobo).toBe(123456);
+    expect(untouched.effectiveFrom).toEqual(fixedDate);
+    expect(untouched.price).toBeUndefined();
+  });
+
   it('backfills StockReceipt.businessDate from receivedAt, then is a no-op on rerun', async () => {
     const collection = mongoose.connection.collection('stockreceipts');
     const receivedAt = new Date('2026-09-22T23:30:00Z');
@@ -98,6 +141,51 @@ describe('business-date / money migration idempotency', () => {
 
     const second = await migrateStockReceiptBusinessDate();
     expect(second.migrated).toBe(0);
+  });
+
+  it('never overwrites a StockReceipt that already has a businessDate', async () => {
+    const collection = mongoose.connection.collection('stockreceipts');
+    const { insertedId } = await collection.insertOne({
+      shopId: new mongoose.Types.ObjectId(),
+      productId: new mongoose.Types.ObjectId(),
+      quantity: 100,
+      receivedBy: new mongoose.Types.ObjectId(),
+      // receivedAt would derive a *different* date than the businessDate
+      // already stored — proving the migration doesn't recompute/overwrite
+      // an existing value.
+      receivedAt: new Date('2026-09-22T23:30:00Z'),
+      businessDate: '2020-01-01',
+      status: 'PENDING',
+    });
+
+    const result = await migrateStockReceiptBusinessDate();
+    expect(result.migrated).toBe(0);
+
+    const untouched = await collection.findOne({ _id: insertedId });
+    expect(untouched.businessDate).toBe('2020-01-01');
+  });
+
+  it('never overwrites an InventoryTransaction that already has a businessDate', async () => {
+    const collection = mongoose.connection.collection('inventorytransactions');
+    const { insertedId } = await collection.insertOne({
+      shopId: new mongoose.Types.ObjectId(),
+      productId: new mongoose.Types.ObjectId(),
+      type: 'OPENING_STOCK',
+      direction: 'IN',
+      quantity: 1000,
+      status: 'APPROVED',
+      createdBy: new mongoose.Types.ObjectId(),
+      // approvedAt/createdAt would derive a different date than the
+      // businessDate already stored.
+      approvedAt: new Date('2026-09-18T08:00:00Z'),
+      businessDate: '2020-01-01',
+    });
+
+    const result = await migrateInventoryTransactionBusinessDate();
+    expect(result.migrated).toBe(0);
+
+    const untouched = await collection.findOne({ _id: insertedId });
+    expect(untouched.businessDate).toBe('2020-01-01');
   });
 
   it('backfills InventoryTransaction.businessDate, preferring a linked receipt businessDate, then is a no-op on rerun', async () => {
