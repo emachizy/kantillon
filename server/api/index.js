@@ -9,18 +9,24 @@ import { connectDB } from '../src/config/db.js';
 // export to invoke per request.
 const app = createApp();
 
-// This module is evaluated once per cold start and reused across warm
-// invocations of the same serverless instance, so this only runs once per
-// instance in practice — not once per request. It's deliberately not
-// awaited at module scope: Mongoose buffers operations by default until
-// the connection is ready, so a request arriving before this resolves
-// still succeeds once it does, and mongoose.connect() is a safe no-op if
-// a connection already exists (readyState !== 0).
-if (mongoose.connection.readyState === 0) {
-  connectDB().catch((err) => {
-    // eslint-disable-next-line no-console
-    console.error('MongoDB connection failed:', err);
-  });
-}
+// The connection is awaited on every invocation before any request reaches
+// Express. On a warm invocation this is a no-op (readyState is already 1),
+// so it costs nothing once connected. If Mongo genuinely can't be reached —
+// e.g. Atlas blocking Vercel's outbound IP — this must fail loudly rather
+// than let Express (and Mongoose's default command buffering) hang the
+// request until an unrelated timeout: the error is logged with full detail
+// here and then rethrown, which Vercel surfaces as a 500 with that log
+// attached to the invocation, not swallowed.
+export default async function handler(req, res) {
+  if (mongoose.connection.readyState !== 1) {
+    try {
+      await connectDB();
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error('MongoDB connection failed:', err);
+      throw err;
+    }
+  }
 
-export default app;
+  return app(req, res);
+}
