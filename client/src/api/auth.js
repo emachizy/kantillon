@@ -13,3 +13,8 @@ export async function fetchCurrentUser() {
   const { data } = await apiClient.get('/auth/me');
   return data.data.user;
 }
+
+export async function changePasswordRequest({ currentPassword, newPassword }) {
+  const { data } = await apiClient.post('/auth/change-password', { currentPassword, newPassword });
+  return data.data.user;
+}

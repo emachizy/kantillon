@@ -22,6 +22,13 @@ const userSchema = new Schema(
     // not by populating this array).
     shopIds: [{ type: Schema.Types.ObjectId, ref: 'Shop', default: [] }],
     isActive: { type: Boolean, default: true },
+    // Set true for staff accounts created by an OWNER with a temporary
+    // password (see services/userManagementService.js createStaffUser()).
+    // The frontend redirects to /change-password while this is true; the
+    // backend does not otherwise restrict what a user with this flag set
+    // can do (see README "Optional first-login password change" for why
+    // that's an accepted, documented MVP limitation).
+    mustChangePassword: { type: Boolean, default: false },
   },
   { timestamps: true }
 );

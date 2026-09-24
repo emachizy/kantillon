@@ -366,7 +366,7 @@ describe('DailySalesReport immutability (money variance resolutions)', () => {
     const reportId = submitRes.body.data.report._id;
     const ownerAgent = await loginAgent(app, 'owner@test.dev');
 
-    const before = await DailySalesReport.findById(reportId).lean();
+    const before = (await DailySalesReport.findById(reportId)).toObject();
 
     const createRes = await ownerAgent.post(`/api/daily-reports/${reportId}/money-variance-resolutions`).send({
       resolutionType: 'RECOVERED',
@@ -379,7 +379,7 @@ describe('DailySalesReport immutability (money variance resolutions)', () => {
       .post(`/api/money-variance-resolutions/${createRes.body.data.resolution._id}/reverse`)
       .send({ reason: 'undo' });
 
-    const after = await DailySalesReport.findById(reportId).lean();
+    const after = (await DailySalesReport.findById(reportId)).toObject();
     expect(after).toEqual(before);
     expect(after).not.toHaveProperty('resolvedStockVarianceMagnitude');
     expect(after).not.toHaveProperty('resolvedMoneyVarianceMagnitudeKobo');
@@ -461,5 +461,51 @@ describe('Reserved vs active state transitions', () => {
 
     const stillProcessing = await MoneyVarianceResolution.findById(stranded._id);
     expect(stillProcessing.status).toBe('PROCESSING');
+  });
+});
+
+describe('Business-truth aggregation source', () => {
+  it('resolvedMoneyVarianceMagnitudeKobo counts only ACTIVE resolutions for the current effective version — never REVERSED or PROCESSING', async () => {
+    const { shopA, product, owner } = await setupShopWithUsers();
+    const sales = await loginAgent(app, 'sales@test.dev');
+    const submitRes = await submitNegativeMoneyVarianceReport(sales, shopA, product, owner); // -2,500,000
+    const reportId = submitRes.body.data.report._id;
+    const ownerAgent = await loginAgent(app, 'owner@test.dev');
+
+    const activeRes = await ownerAgent.post(`/api/daily-reports/${reportId}/money-variance-resolutions`).send({
+      resolutionType: 'RECOVERED',
+      amountKobo: 500000,
+      reason: 'real active resolution',
+    });
+    expect(activeRes.status).toBe(201);
+
+    await MoneyVarianceResolution.create({
+      dailySalesReportId: reportId,
+      dailySalesCorrectionId: null,
+      shopId: shopA._id,
+      sourceBusinessDate: '2020-01-10',
+      resolutionType: 'RECOVERED',
+      amountKobo: 700000,
+      reason: 'historical, already reversed',
+      status: 'REVERSED',
+      resolvedBy: owner._id,
+    });
+
+    await MoneyVarianceResolution.create({
+      dailySalesReportId: reportId,
+      dailySalesCorrectionId: null,
+      shopId: shopA._id,
+      sourceBusinessDate: '2020-01-10',
+      resolutionType: 'RECOVERED',
+      amountKobo: 900000,
+      reason: 'crash-stranded, still processing',
+      status: 'PROCESSING',
+      resolvedBy: owner._id,
+    });
+
+    const effectiveRes = await ownerAgent.get(`/api/daily-reports/${reportId}/effective`);
+    expect(effectiveRes.body.data.resolvedMoneyVarianceMagnitudeKobo).toBe(500000);
+    expect(effectiveRes.body.data.unresolvedMoneyVarianceKobo).toBe(-2000000);
+    expect(effectiveRes.body.data.moneyResolutions).toHaveLength(3);
   });
 });

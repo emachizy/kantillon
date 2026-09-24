@@ -1,3 +1,4 @@
+import mongoose from 'mongoose';
 import { DailySalesReport } from '../models/DailySalesReport.js';
 import { DailyReportCorrectionRequest } from '../models/DailyReportCorrectionRequest.js';
 import { DailySalesCorrection } from '../models/DailySalesCorrection.js';
@@ -12,7 +13,9 @@ import { computeRemainingSigned } from '../utils/variance.js';
 import {
   getActiveMagnitudes,
   hasAnyResolutionActivity,
-  syncResolutionStateToEffectiveVersion,
+  claimCorrectionProcessingLock,
+  releaseCorrectionProcessingLockOnFailure,
+  releaseCorrectionProcessingLockWithNewVersion,
 } from './dailyReportResolutionStateService.js';
 
 const REQUEST_POPULATE = [
@@ -235,21 +238,17 @@ export async function approveCorrectionRequest({ id, actingUser, req }) {
     throw ApiError.conflict(`Correction request is already ${current.status} and cannot be approved`);
   }
 
-  // Once this is true, the DailySalesCorrection (and any ledger effects)
-  // are real and committed — the catch block below must never revert the
-  // request back to PENDING past this point, since that would let it be
-  // re-approved into a SECOND correction on top of one that already
-  // exists. Anything that fails after this is a workflow-state divergence
-  // to surface loudly, not something to paper over. Declared here (outside
-  // the try) so the catch block below can read it.
-  let correctionEffectsCompleted = false;
+  // True once claimCorrectionProcessingLock() below actually succeeds — the
+  // catch block needs to know whether there's a lock to release. Declared
+  // here (outside the try) so the catch block can read it.
+  let lockClaimed = false;
 
   try {
     const report = await DailySalesReport.findById(request.dailySalesReportId);
     if (!report) throw ApiError.internal('The daily sales report linked to this correction no longer exists');
 
-    // Re-check: a resolution could theoretically have been posted while
-    // this request sat PENDING. Never silently approve into that state.
+    // Friendly pre-check; the atomic lock claim below is the real,
+    // race-proof guard (see the comment on claimCorrectionProcessingLock).
     if (await hasAnyResolutionActivity(report._id)) {
       throw ApiError.conflict(
         'Active stock or money variance resolutions now exist for this report; ' +
@@ -275,11 +274,22 @@ export async function approveCorrectionRequest({ id, actingUser, req }) {
     const quantityChanged = totalQuantitySold !== previousEffective.quantity;
     const correctionNumber = (await DailySalesCorrection.countDocuments({ dailySalesReportId: report._id })) + 1;
     const previousCorrection = await getLatestApprovedCorrection(report._id);
+    const previousEffectiveCorrectionId = previousCorrection?._id ?? null;
+
+    // The real, race-proof guard: atomically claim the shared coordination
+    // lock BEFORE building any correction ledger effects. This closes the
+    // race where a stock/money resolution reserves against the current
+    // effective version between the friendly check above and this
+    // correction actually becoming effective. See README "Correction/
+    // resolution shared lock".
+    await claimCorrectionProcessingLock(report._id, previousEffectiveCorrectionId, request._id);
+    lockClaimed = true;
 
     const result = await runWithOptionalTransaction(async (session) => {
       let createdCorrection;
       let reversalTxn;
       let replacementTxn;
+      let finalRequest;
       try {
         [createdCorrection] = await DailySalesCorrection.create(
           [
@@ -365,7 +375,38 @@ export async function approveCorrectionRequest({ id, actingUser, req }) {
           await createdCorrection.save({ session });
         }
 
-        return { correction: createdCorrection, reversalTxn, replacementTxn };
+        // The final PENDING-claim-to-APPROVED transition lives INSIDE this
+        // same attempt — on a replica set, it commits or rolls back
+        // atomically together with the correction + ledger effects above,
+        // eliminating the workflow-divergence window entirely. On our
+        // confirmed-standalone MongoDB it is NOT atomic with the writes
+        // above (see the catch below, which cleans up everything created
+        // in this attempt if this step fails) — we do not fake that
+        // guarantee here. Still conditioned on status still being
+        // PROCESSING, and we return THIS document, never the stale
+        // PROCESSING one captured at claim time — the API must never
+        // report PROCESSING as the outcome of a successful approval.
+        finalRequest = await DailyReportCorrectionRequest.findOneAndUpdate(
+          { _id: request._id, status: 'PROCESSING' },
+          { status: 'APPROVED', approvedCorrectionId: createdCorrection._id },
+          { new: true, session }
+        ).populate(REQUEST_POPULATE);
+
+        if (!finalRequest) {
+          // Unreachable in normal operation — we hold the only valid
+          // PROCESSING claim. Treat exactly like any other failure in this
+          // attempt: on standalone this falls through to the catch below,
+          // which cleans up the correction + ledger effects just created
+          // (so APPROVED can never exist without them, and nothing is left
+          // half-applied); on a replica set the whole transaction rolls
+          // back automatically.
+          throw ApiError.internal(
+            'Correction request workflow state changed unexpectedly during approval ' +
+              '(expected PROCESSING).'
+          );
+        }
+
+        return { correction: createdCorrection, reversalTxn, replacementTxn, request: finalRequest };
       } catch (err) {
         if (session) {
           throw err;
@@ -385,6 +426,7 @@ export async function approveCorrectionRequest({ id, actingUser, req }) {
           createdCorrectionId: createdCorrection?._id,
           reversalTxnId: reversalTxn?._id,
           replacementTxnId: replacementTxn?._id,
+          finalTransitionSucceeded: Boolean(finalRequest),
           originalError: err,
           cleanupAttempted: cleanupTasks.length,
           cleanupFailures: cleanupFailures.length,
@@ -403,49 +445,15 @@ export async function approveCorrectionRequest({ id, actingUser, req }) {
       }
     });
 
-    correctionEffectsCompleted = true;
-
-    // Only now — after the correction and its ledger effects fully exist —
-    // does the request become visibly APPROVED. This is itself an atomic
-    // conditional transition (still PROCESSING), and we return THIS
-    // document, never the stale PROCESSING one captured at claim time —
-    // the API must never report PROCESSING as the outcome of a successful
-    // approval.
-    const finalRequest = await DailyReportCorrectionRequest.findOneAndUpdate(
-      { _id: request._id, status: 'PROCESSING' },
-      { status: 'APPROVED', approvedCorrectionId: result.correction._id },
-      { new: true }
-    ).populate(REQUEST_POPULATE);
-
-    if (!finalRequest) {
-      // The correction was built successfully and already committed, but
-      // the request unexpectedly wasn't PROCESSING anymore (something else
-      // must have mutated it — this should be unreachable in normal
-      // operation, since we hold the only valid PROCESSING claim). Do NOT
-      // silently treat this as success, and do NOT let the catch below
-      // revert it to PENDING (the correction is real; reverting would let
-      // it be approved a second time). Surface it loudly for manual review.
-      const current = await DailyReportCorrectionRequest.findById(request._id);
-      // eslint-disable-next-line no-console
-      console.error('[DAILY_CORRECTION_WORKFLOW_DIVERGENCE]', {
-        requestId: request._id,
-        correctionId: result.correction._id,
-        expectedStatus: 'PROCESSING',
-        actualStatus: current?.status ?? '(request no longer exists)',
-      });
-      throw ApiError.internal(
-        'The correction was built successfully, but the request could not be finalized as ' +
-          'APPROVED due to an unexpected workflow-state divergence. The correction record exists ' +
-          'and must be reconciled manually — see server logs for DAILY_CORRECTION_WORKFLOW_DIVERGENCE.'
-      );
-    }
-
-    // The newly-approved correction is now the effective version; make sure
-    // the resolution-state coordination doc (if one exists yet) reflects
-    // that. All four counters are guaranteed zero at this point (the
-    // hasAnyResolutionActivity check above), so this is bookkeeping, not a
-    // reset of anything live.
-    await syncResolutionStateToEffectiveVersion(report._id, result.correction._id);
+    // At this point the attempt above fully succeeded (correction, ledger
+    // effects, and the request's PROCESSING->APPROVED transition together)
+    // — nothing left half-applied, so it is always safe to proceed. Release
+    // the coordination lock AND switch effectiveCorrectionId to the newly-
+    // approved correction in one step — this never throws (the correction
+    // is already real and committed by this point; a failure here is only
+    // ever a stranded-lock divergence to log and reconcile manually, never
+    // a reason to treat the approval itself as failed).
+    await releaseCorrectionProcessingLockWithNewVersion(report._id, request._id, result.correction._id);
 
     await recordAudit({
       req,
@@ -466,22 +474,28 @@ export async function approveCorrectionRequest({ id, actingUser, req }) {
     });
 
     await result.correction.populate(CORRECTION_POPULATE);
-    return { correction: result.correction, request: finalRequest };
+    return { correction: result.correction, request: result.request };
   } catch (err) {
-    if (correctionEffectsCompleted) {
-      // The correction already exists — never revert to PENDING past this
-      // point (see the comment where the flag is set above). Just surface
-      // the error; DAILY_CORRECTION_WORKFLOW_DIVERGENCE (if that's what
-      // this is) was already logged above.
-      throw err;
+    // Any failure here means the WHOLE attempt failed — the correction,
+    // its ledger effects, and the request's final transition are all
+    // created (or cleaned up) together inside runWithOptionalTransaction
+    // above (atomically on a replica set; via manual cleanup on our
+    // confirmed-standalone MongoDB). So by the time we reach here, the
+    // request is guaranteed to still be PROCESSING with nothing else
+    // committed — reverting it to PENDING is always safe. A genuine hard
+    // process crash between the claim above and this catch running is the
+    // one case this can't fix — see the comment on the atomic claim above
+    // and README "Correction approval state machine".
+    if (lockClaimed) {
+      // Release the coordination lock (never changes effectiveCorrectionId
+      // here — the correction never became real) so subsequent stock/money
+      // resolution attempts against this still-current version aren't
+      // blocked forever by a lock nobody would otherwise release.
+      await releaseCorrectionProcessingLockOnFailure(request.dailySalesReportId, request._id).catch((lockErr) => {
+        // eslint-disable-next-line no-console
+        console.error('[DAILY_CORRECTION_REVERT_FAILURE]', { id, lockErr });
+      });
     }
-
-    // The approval's actual effect never completed — revert the request
-    // from PROCESSING back to PENDING so it doesn't sit forever in a state
-    // that looks like "someone is handling this" with nothing behind it.
-    // A genuine hard process crash between the claim above and this catch
-    // running is the one case this can't fix — see the comment on the
-    // atomic claim above and README "Correction approval state machine".
     await DailyReportCorrectionRequest.updateOne(
       { _id: id, status: 'PROCESSING' },
       { status: 'PENDING', reviewedBy: null, reviewedAt: null }
@@ -491,6 +505,49 @@ export async function approveCorrectionRequest({ id, actingUser, req }) {
     });
     throw err;
   }
+}
+
+// Normalizes an effective-version id (ObjectId, string, or null) to
+// exactly what an aggregation $match needs: a real ObjectId, or null.
+function toVersionMatchValue(effectiveCorrectionId) {
+  return effectiveCorrectionId ? new mongoose.Types.ObjectId(effectiveCorrectionId) : null;
+}
+
+// BUSINESS TRUTH, not the coordination cache: the sum of quantities from
+// StockVarianceResolution documents that are (a) ACTIVE and (b) posted
+// against the SPECIFIED effective version — dailySalesCorrectionId must
+// match exactly (null means "the original report", not "any version").
+// Historical resolutions against an older effective version remain fully
+// visible in history but never reduce a newer version's unresolved
+// discrepancy. See README "Source-of-truth hierarchy" /
+// "Filter resolutions by effective version".
+export async function getActiveStockResolutionMagnitude(reportId, effectiveCorrectionId) {
+  const [result] = await StockVarianceResolution.aggregate([
+    {
+      $match: {
+        dailySalesReportId: new mongoose.Types.ObjectId(reportId),
+        dailySalesCorrectionId: toVersionMatchValue(effectiveCorrectionId),
+        status: 'ACTIVE',
+      },
+    },
+    { $group: { _id: null, total: { $sum: '$quantity' } } },
+  ]);
+  return result?.total ?? 0;
+}
+
+// Same as above, for MoneyVarianceResolution.
+export async function getActiveMoneyResolutionMagnitude(reportId, effectiveCorrectionId) {
+  const [result] = await MoneyVarianceResolution.aggregate([
+    {
+      $match: {
+        dailySalesReportId: new mongoose.Types.ObjectId(reportId),
+        dailySalesCorrectionId: toVersionMatchValue(effectiveCorrectionId),
+        status: 'ACTIVE',
+      },
+    },
+    { $group: { _id: null, total: { $sum: '$amountKobo' } } },
+  ]);
+  return result?.total ?? 0;
 }
 
 function effectiveSnapshotFrom(report, latestCorrection) {
@@ -541,22 +598,57 @@ export async function getEffectiveDailyReport(reportId) {
   const latestCorrection = corrections.length ? corrections[corrections.length - 1] : null;
 
   const effective = effectiveSnapshotFrom(report, latestCorrection);
+  const effectiveCorrectionId = latestCorrection?._id ?? null;
 
-  const [stockResolutions, moneyResolutions, magnitudes] = await Promise.all([
-    StockVarianceResolution.find({ dailySalesReportId: reportId })
-      .sort({ createdAt: 1 })
-      .populate([
-        { path: 'resolvedBy', select: 'name role' },
-        { path: 'reversedBy', select: 'name role' },
-      ]),
-    MoneyVarianceResolution.find({ dailySalesReportId: reportId })
-      .sort({ createdAt: 1 })
-      .populate([
-        { path: 'resolvedBy', select: 'name role' },
-        { path: 'reversedBy', select: 'name role' },
-      ]),
-    getActiveMagnitudes(reportId),
-  ]);
+  const [stockResolutions, moneyResolutions, activeStockMagnitude, activeMoneyMagnitude, coordination] =
+    await Promise.all([
+      StockVarianceResolution.find({ dailySalesReportId: reportId })
+        .sort({ createdAt: 1 })
+        .populate([
+          { path: 'resolvedBy', select: 'name role' },
+          { path: 'reversedBy', select: 'name role' },
+        ]),
+      MoneyVarianceResolution.find({ dailySalesReportId: reportId })
+        .sort({ createdAt: 1 })
+        .populate([
+          { path: 'resolvedBy', select: 'name role' },
+          { path: 'reversedBy', select: 'name role' },
+        ]),
+      // BUSINESS TRUTH — aggregated fresh from ACTIVE resolution documents
+      // for the current effective version, never trusted from the
+      // coordination-state cache. See README "Source-of-truth hierarchy".
+      getActiveStockResolutionMagnitude(reportId, effectiveCorrectionId),
+      getActiveMoneyResolutionMagnitude(reportId, effectiveCorrectionId),
+      // Coordination cache — used ONLY for the diagnostic "processing"
+      // amounts below, and for the divergence check.
+      getActiveMagnitudes(reportId),
+    ]);
+
+  // Diagnostic-only: if the coordination cache disagrees with the true
+  // ACTIVE-document sum FOR THE SAME effective version, that's a real bug
+  // to investigate — log it loudly, but never let the cache override the
+  // aggregated business truth returned below. A mismatch while the
+  // coordination state is tracking a DIFFERENT effective version is not
+  // comparable (that's syncResolutionStateToEffectiveVersion's concern,
+  // not this one), so only compare when the versions actually match.
+  const coordinationTracksCurrentVersion =
+    (coordination.effectiveCorrectionId ? coordination.effectiveCorrectionId.toString() : null) ===
+    (effectiveCorrectionId ? effectiveCorrectionId.toString() : null);
+  if (
+    coordinationTracksCurrentVersion &&
+    (coordination.activeStockVarianceMagnitude !== activeStockMagnitude ||
+      coordination.activeMoneyVarianceMagnitudeKobo !== activeMoneyMagnitude)
+  ) {
+    // eslint-disable-next-line no-console
+    console.error('[RESOLUTION_STATE_CACHE_DIVERGENCE]', {
+      reportId,
+      effectiveCorrectionId,
+      cachedActiveStockVarianceMagnitude: coordination.activeStockVarianceMagnitude,
+      trueActiveStockResolutionMagnitude: activeStockMagnitude,
+      cachedActiveMoneyVarianceMagnitudeKobo: coordination.activeMoneyVarianceMagnitudeKobo,
+      trueActiveMoneyResolutionMagnitudeKobo: activeMoneyMagnitude,
+    });
+  }
 
   return {
     original: report,
@@ -564,25 +656,22 @@ export async function getEffectiveDailyReport(reportId) {
     effectiveCorrection: latestCorrection,
     effective,
     isCorrected: Boolean(latestCorrection),
-    // "Remaining" is computed from ACTIVE resolutions only — a PROCESSING
-    // (in-flight, reserved) resolution is never subtracted from the
-    // business-facing remaining variance. See README "Reserved vs active".
-    unresolvedStockVarianceQuantity: computeRemainingSigned(
-      effective.stockVarianceQuantity,
-      magnitudes.activeStockVarianceMagnitude
-    ),
-    unresolvedMoneyVarianceKobo: computeRemainingSigned(
-      effective.moneyVarianceKobo,
-      magnitudes.activeMoneyVarianceMagnitudeKobo
-    ),
-    // User-facing "resolved" — ACTIVE only, never includes PROCESSING.
-    resolvedStockVarianceMagnitude: magnitudes.activeStockVarianceMagnitude,
-    resolvedMoneyVarianceMagnitudeKobo: magnitudes.activeMoneyVarianceMagnitudeKobo,
-    // Separate, explicit "in flight, not yet resolved" amounts — a UI can
-    // show these as "N bags currently processing" without ever implying
-    // they're resolved.
-    processingStockResolutionMagnitude: magnitudes.reservedStockVarianceMagnitude,
-    processingMoneyResolutionMagnitudeKobo: magnitudes.reservedMoneyVarianceMagnitudeKobo,
+    // "Remaining" is ABS(effective variance) minus the ACTIVE-resolution
+    // sum for the current effective version, sign preserved. A PROCESSING
+    // (in-flight, reserved) resolution is never subtracted here.
+    unresolvedStockVarianceQuantity: computeRemainingSigned(effective.stockVarianceQuantity, activeStockMagnitude),
+    unresolvedMoneyVarianceKobo: computeRemainingSigned(effective.moneyVarianceKobo, activeMoneyMagnitude),
+    // User-facing "resolved" — the true ACTIVE-document aggregation for the
+    // current effective version, never the coordination cache, never
+    // PROCESSING.
+    resolvedStockVarianceMagnitude: activeStockMagnitude,
+    resolvedMoneyVarianceMagnitudeKobo: activeMoneyMagnitude,
+    // Separate, explicit "in flight, not yet resolved" amounts (from the
+    // coordination cache — this IS what that cache is for) — a UI can show
+    // these as "N bags currently processing" without ever implying they're
+    // resolved.
+    processingStockResolutionMagnitude: coordination.reservedStockVarianceMagnitude,
+    processingMoneyResolutionMagnitudeKobo: coordination.reservedMoneyVarianceMagnitudeKobo,
     stockResolutions,
     moneyResolutions,
   };

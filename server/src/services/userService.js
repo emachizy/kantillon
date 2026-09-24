@@ -7,8 +7,10 @@ export async function findUserByEmail(email, { withPassword = false } = {}) {
   return query.exec();
 }
 
-export async function findUserById(id) {
-  return User.findById(id);
+export async function findUserById(id, { withPassword = false } = {}) {
+  const query = User.findById(id);
+  if (withPassword) query.select('+passwordHash');
+  return query.exec();
 }
 
 // The one place a User document is created. Used by the seed script now;

@@ -401,6 +401,7 @@ client/.env.example  →  client/.env
 | `COOKIE_NAME` | Name of the httpOnly auth cookie |
 | `CLIENT_ORIGIN` | Frontend origin allowed by CORS |
 | `AUTH_RATE_LIMIT_WINDOW_MS` / `AUTH_RATE_LIMIT_MAX` | Login rate limiting |
+| `BOOTSTRAP_OWNER_NAME` / `BOOTSTRAP_OWNER_EMAIL` / `BOOTSTRAP_OWNER_PASSWORD` | Only read by `npm run bootstrap-owner` (see "First production OWNER" below) — not used by the normal server process |
 
 **`client/.env`**
 
@@ -478,6 +479,42 @@ Both operate on raw collections (not the Mongoose model) so they can read docume
 | MANAGER (Shop A) | `manager@kantillon.dev` | `DevPass123!` |
 | SALESPERSON (Shop A) | `sales@kantillon.dev` | `DevPass123!` |
 
+## First production OWNER
+
+Kantillon has **no public sign-up**. `npm run seed` refuses to run against production (see above), so a fresh production database starts with zero users and nobody could otherwise ever log in. `npm run bootstrap-owner` (`server/src/scripts/bootstrapOwner.js`) exists specifically to solve that one-time problem, safely:
+
+1. Configure your production `MONGO_URI` (in your deployment platform's environment, or a local `.env` you don't commit).
+2. Set `BOOTSTRAP_OWNER_NAME`.
+3. Set `BOOTSTRAP_OWNER_EMAIL`.
+4. Set `BOOTSTRAP_OWNER_PASSWORD` (8+ characters — the same rule every other password in the system follows).
+5. Run:
+   ```bash
+   cd server
+   MONGO_URI="<production connection string>" \
+   BOOTSTRAP_OWNER_NAME="Your Name" \
+   BOOTSTRAP_OWNER_EMAIL="you@example.com" \
+   BOOTSTRAP_OWNER_PASSWORD="<a strong password>" \
+   npm run bootstrap-owner
+   ```
+6. Log into Kantillon with that email and password.
+7. Create your shop(s) from **Shops** (`/shops/manage`) — a fresh production database starts with zero shops too, so this comes before staff onboarding.
+8. Create every further staff account from **Users & Staff**, assigning each one to the shop(s) they should see — never by running this script again for anyone but the very first owner.
+9. Staff log in with the temporary password the OWNER gave them, and are prompted to set their own on first login.
+
+Unlike `npm run seed`, this script **runs fine with `NODE_ENV=production`** — that's the point of it. It never wipes any collection, hashes the password with the exact same `User.hashPassword` bcrypt logic every other account uses, and refuses (non-zero exit, no partial write) if the email already exists — so re-running it by accident is safe, not destructive. No real credentials are ever hardcoded in the script or committed to the repo; everything comes from the environment variables you supply at run time.
+
+### How staff onboarding works from there
+
+There is no self-registration anywhere in Kantillon — the login page only ever has Email/Password. Every other account is created by an OWNER, from the app itself:
+
+- **OWNER** creates shops from **Shops** (`/shops/manage`) — name is the only required field; address/phone/notes are optional. A shop's `code` (a short unique identifier the ledger and receipts already key off) is generated automatically from the name, so the OWNER never has to think about a second identifier.
+- Shops are **soft-deactivated, never hard-deleted** — deactivating a shop (from its Manage Shop page) sets `isActive: false` and preserves every historical inventory transaction, stock receipt, daily report, and audit entry tied to it, plus every staff member's existing assignment to it. Deactivating does **not** unassign staff — a manager or salesperson keeps the shop in their `shopIds` and can see its history, they just can't submit new opening stock, stock receipts, or daily reports to it until an OWNER reactivates it. `GET /api/shops` only returns active shops by default for every role, including OWNER; only OWNER can pass `?includeInactive=true` (used by the Shops management page) to see and reactivate a deactivated one.
+- **OWNER** creates staff accounts from **Users & Staff** (`/users`), choosing a role of **Salesperson**, **Manager**, or **Admin** — an OWNER can never be created through this screen or its API, only through the one-time bootstrap script above. This is a deliberate MVP restriction against accidentally creating a second unrestricted superuser; multi-owner support, if ever needed, should be a distinct, deliberate future feature.
+- The OWNER sets a **temporary password** at creation time (shown once, in the success screen, from what was just typed into the form — never re-fetched from the backend afterward) and assigns the new user to one or more shops. Assignment can also happen later, from the same user's **Manage** screen, or from **Staff** on an individual shop's page (both write to the same `User.shopIds` field — there is no separate assignment table).
+- **Inactive users cannot log in** — `authenticate()` checks `isActive` before even comparing the password, with the same "invalid email or password" message used for a wrong password, so deactivation can't be detected by an outside login attempt either.
+- **OWNER has global shop access** regardless of `shopIds` (enforced in `services/shopAccessService.js`, unchanged by this feature). **MANAGER** and **SALESPERSON** access comes entirely from their `shopIds` array — assign or remove a shop and their access changes immediately, enforced server-side on every request (`requireShopAccess` middleware), never something the frontend can widen by itself.
+- New staff accounts are created with `mustChangePassword: true`; the frontend redirects them to `/change-password` on first login. This is the one deliberately optional piece from the original request that *was* implemented (see "Assumptions" below) rather than skipped, since it turned out to be a small, self-contained addition (`POST /api/auth/change-password`, which — unlike an OWNER-driven reset — always verifies the current password first) that didn't touch the existing login flow at all.
+
 ## Tests
 
 ```bash
@@ -551,7 +588,7 @@ Phase 4 additions (82 new tests across `dailyReportCorrection.test.js`, `stockVa
 - `POST /api/auth/login`
 - `POST /api/auth/logout`
 - `GET /api/auth/me`
-- `GET /api/shops` — OWNER sees all shops; everyone else sees only shops in their `shopIds`
+- `GET /api/shops` — active shops only; OWNER sees all of them, everyone else sees only shops in their `shopIds`. OWNER may add `?includeInactive=true` to also see deactivated shops.
 - `GET /api/products` — not shop-scoped, visible to any authenticated user
 
 **Phase 2:** see "Inventory & stock-receipt API summary" above for the full list (`/api/inventory/opening-stock`, `/api/inventory/shop/:shopId`, `/api/stock-receipts` and its sub-routes).
@@ -577,6 +614,19 @@ Phase 4 additions (82 new tests across `dailyReportCorrection.test.js`, `stockVa
 
 No edit or delete endpoint exists for any Phase 4 resource — corrections and resolutions are append-only by design (see "Immutable report architecture" above).
 
+**Owner shop management:**
+
+| Endpoint | Access |
+| --- | --- |
+| `POST /api/shops` | OWNER only |
+| `GET /api/shops/:shopId` | OWNER may access any shop; other roles only if `shopIds`-permitted |
+| `PATCH /api/shops/:shopId` | OWNER only |
+| `POST /api/shops/:shopId/deactivate` | OWNER only |
+| `POST /api/shops/:shopId/reactivate` | OWNER only |
+| `GET /api/shops/:shopId/staff` | OWNER only |
+
+Shops are never hard-deleted (see "How staff onboarding works from there" above).
+
 ## Frontend (mobile-first)
 
 - **OWNER** sees a Home screen listing every shop with its current balance and a pending-approvals count; tapping a shop opens its inventory, where any uninitialized product shows an "Initialize opening stock" form; a bottom-nav "Approvals" tab lists every pending receipt with Approve / Reject (reason required) actions; a "Daily Summary" tab lets the owner pick a business date and see every submitted shop/product report as a card (bags sold, expected/physical closing, stock status, expected/collected revenue, money status — shortage/surplus stated in text, never color alone), tappable through to the full report detail.
@@ -591,7 +641,7 @@ No edit or delete endpoint exists for any Phase 4 resource — corrections and r
 - User creation is not yet exposed as an API route — `services/userService.createUser` exists and is used by the seed script, ready to be wired to an admin-only route in a later phase.
 - Shop/Product creation endpoints are intentionally not built yet (Phase 1 only asked for read access); the models and validators are in place to add them later.
 - Tests run against a real local MongoDB database rather than an in-memory server — `mongodb-memory-server` attempted to download a MongoDB binary and was unreliable in this environment; a real local instance was already available and is arguably a better fit for ledger/authorization correctness tests anyway.
-- Cookie `sameSite` is `lax` with `secure` tied to `NODE_ENV=production`; revisit if the frontend and backend ever end up on different top-level domains (would need `sameSite: 'none'` + `secure: true` + HTTPS everywhere).
+- Cookie config is environment-aware (`server/src/utils/cookies.js`): development uses `sameSite: 'lax'` + `secure: false` (works over plain `http://localhost`); production uses `sameSite: 'none'` + `secure: true`, required because the deployed frontend (`kantillon.onrender.com`) and API (`kantillon-api.onrender.com`) are different origins and browsers refuse to send a cross-origin cookie under `SameSite=Lax`.
 
 ## Assumptions made in Phase 2
 

@@ -61,6 +61,16 @@ const stockVarianceResolutionSchema = new Schema(
       ref: 'InventoryTransaction',
       default: null,
     },
+    // A concurrency claim for the reversal workflow, distinct from status
+    // itself: status only becomes REVERSED once the opposing REVERSAL
+    // InventoryTransaction safely exists (business truth must never claim
+    // "reversed" before the ledger effect that makes it true). This flag is
+    // what makes "ACTIVE, reversal in flight" a distinguishable, race-proof
+    // state — see services/stockVarianceResolutionService.js
+    // reverseStockVarianceResolution(). true left stranded (status still
+    // ACTIVE) after a hard crash is a visible, queryable manual-review
+    // state, same spirit as a PROCESSING resolution.
+    reversalProcessing: { type: Boolean, default: false },
     // The business date the adjustment InventoryTransaction was actually
     // posted on — may differ from sourceBusinessDate; see
     // services/dailySalesReportService.js resolvePostingBusinessDate().

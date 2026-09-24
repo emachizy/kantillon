@@ -10,12 +10,14 @@ import shopPriceRoutes from './shopPrice.routes.js';
 import correctionRequestRoutes from './correctionRequest.routes.js';
 import stockVarianceResolutionRoutes from './stockVarianceResolution.routes.js';
 import moneyVarianceResolutionRoutes from './moneyVarianceResolution.routes.js';
+import userRoutes from './user.routes.js';
 
 const router = Router();
 
 router.use('/health', healthRoutes);
 router.use('/auth', authRoutes);
 router.use('/shops', shopRoutes);
+router.use('/users', userRoutes);
 router.use('/products', productRoutes);
 router.use('/inventory', inventoryRoutes);
 router.use('/stock-receipts', stockReceiptRoutes);

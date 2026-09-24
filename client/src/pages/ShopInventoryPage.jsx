@@ -4,6 +4,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useAuth } from '../context/AuthContext.jsx';
 import { fetchShopInventory, createOpeningStock } from '../api/inventory.js';
 import { submitStockReceipt } from '../api/stockReceipts.js';
+import { ShopStaffSection } from '../components/ShopStaffSection.jsx';
 
 function errorMessage(error, fallback) {
   return error?.response?.data?.message || fallback;
@@ -69,8 +70,7 @@ function ReceiptForm({ product, onSubmit, isPending, error, isSuccess }) {
   }
 
   return (
-    <form onSubmit={handleSubmit} className="mt-2 space-y-2 border-t border-slate-100 pt-2">
-      <p className="text-xs font-medium text-slate-600">Report stock received</p>
+    <form onSubmit={handleSubmit} className="space-y-2">
       <input
         type="number"
         min="1"
@@ -102,9 +102,45 @@ function ReceiptForm({ product, onSubmit, isPending, error, isSuccess }) {
         disabled={isPending}
         className="w-full rounded-md bg-slate-900 px-3 py-2 text-sm font-medium text-white disabled:opacity-50"
       >
-        {isPending ? 'Submitting...' : 'Submit stock receipt'}
+        {isPending ? 'Submitting...' : 'Submit'}
       </button>
     </form>
+  );
+}
+
+// Two side-by-side (stacked on very narrow screens) cards for the daily,
+// per-product actions staff actually do in a shop — kept visually separate
+// from any future shop-management navigation. "Receive Stock" reveals the
+// existing stock-receipt form in place (no new route); "Daily Report"
+// navigates to the existing daily-report route, unchanged.
+function QuickActions({ shopId, product, isReceiptOpen, onToggleReceipt }) {
+  return (
+    <div>
+      <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">Quick actions</h3>
+      <div className="flex flex-col gap-2 min-[360px]:flex-row">
+        <button
+          type="button"
+          onClick={onToggleReceipt}
+          aria-expanded={isReceiptOpen}
+          className={`flex-1 rounded-xl border p-3 text-left shadow-sm transition active:bg-slate-50 ${
+            isReceiptOpen ? 'border-slate-900 bg-slate-900 text-white' : 'border-slate-200 bg-white'
+          }`}
+        >
+          <p className={`text-sm font-semibold ${isReceiptOpen ? 'text-white' : 'text-slate-900'}`}>
+            Receive Stock
+          </p>
+          <p className={`text-xs ${isReceiptOpen ? 'text-slate-300' : 'text-slate-500'}`}>Record a delivery</p>
+        </button>
+
+        <Link
+          to={`/shops/${shopId}/products/${product.id}/daily-report`}
+          className="flex-1 rounded-xl border border-slate-200 bg-white p-3 shadow-sm transition active:bg-slate-50"
+        >
+          <p className="text-sm font-semibold text-slate-900">Daily Report</p>
+          <p className="text-xs text-slate-500">Record today&apos;s sales &amp; closing count</p>
+        </Link>
+      </div>
+    </div>
   );
 }
 
@@ -113,6 +149,7 @@ export function ShopInventoryPage() {
   const { user } = useAuth();
   const isOwner = user?.role === 'OWNER';
   const queryClient = useQueryClient();
+  const [openReceiptProductId, setOpenReceiptProductId] = useState(null);
 
   const inventoryQuery = useQuery({
     queryKey: ['inventory', 'shop', shopId],
@@ -128,9 +165,11 @@ export function ShopInventoryPage() {
 
   const receiptMutation = useMutation({
     mutationFn: submitStockReceipt,
-    onSuccess: () => {
+    onSuccess: (_data, variables) => {
       queryClient.invalidateQueries({ queryKey: ['inventory', 'shop', shopId] });
       queryClient.invalidateQueries({ queryKey: ['stockReceipts'] });
+      // Collapse the form back to its quick-action card once submitted.
+      if (variables?.productId === openReceiptProductId) setOpenReceiptProductId(null);
     },
   });
 
@@ -147,62 +186,96 @@ export function ShopInventoryPage() {
   }
 
   const { shop, inventory } = inventoryQuery.data;
+  const singleLine = inventory.length === 1 ? inventory[0] : null;
 
   return (
     <div className="space-y-4">
-      <h1 className="text-lg font-semibold text-slate-900">{shop.name}</h1>
+      <Link to="/" className="inline-block text-sm text-slate-500">
+        ← Shops
+      </Link>
 
-      <div className="space-y-3">
-        {inventory.length === 0 && <p className="text-sm text-slate-500">No products configured.</p>}
+      <div className="flex items-center justify-between">
+        <h1 className="text-lg font-semibold text-slate-900">{shop.name}</h1>
+        {isOwner && (
+          <Link to={`/shops/manage/${shopId}`} className="text-xs font-medium text-slate-500">
+            Manage shop details →
+          </Link>
+        )}
+      </div>
+
+      {singleLine && (
+        <div className="rounded-xl border border-slate-200 bg-white p-3">
+          <p className="text-xs font-medium text-slate-500">Current Stock</p>
+          <p className="text-lg font-semibold text-slate-900">
+            {singleLine.balance} {singleLine.product.unit}
+          </p>
+        </div>
+      )}
+
+      {inventory.length === 0 && <p className="text-sm text-slate-500">No products configured.</p>}
+
+      <div className="space-y-5">
         {inventory.map((line) => (
-          <div key={line.product.id} className="rounded-lg border border-slate-200 bg-white p-3">
-            <div className="flex items-center justify-between">
-              <span className="font-medium text-slate-900">{line.product.name}</span>
-              <span className="text-sm text-slate-700">
-                {line.balance} {line.product.unit}
-              </span>
-            </div>
+          <div key={line.product.id} className="space-y-2">
+            {!singleLine && (
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-semibold text-slate-900">{line.product.name}</span>
+                <span className="text-sm text-slate-700">
+                  {line.balance} {line.product.unit}
+                </span>
+              </div>
+            )}
 
             {isOwner && !line.initialized && (
-              <OpeningStockForm
-                product={line.product}
-                isPending={openingStockMutation.isPending}
-                error={openingStockMutation.error}
-                isSuccess={
-                  openingStockMutation.isSuccess &&
-                  openingStockMutation.variables?.productId === line.product.id
-                }
-                onSubmit={(quantity, notes) =>
-                  openingStockMutation.mutate({ shopId, productId: line.product.id, quantity, notes })
-                }
-              />
+              <div className="rounded-xl border border-slate-200 bg-white p-3">
+                <OpeningStockForm
+                  product={line.product}
+                  isPending={openingStockMutation.isPending}
+                  error={openingStockMutation.error}
+                  isSuccess={
+                    openingStockMutation.isSuccess &&
+                    openingStockMutation.variables?.productId === line.product.id
+                  }
+                  onSubmit={(quantity, notes) =>
+                    openingStockMutation.mutate({ shopId, productId: line.product.id, quantity, notes })
+                  }
+                />
+              </div>
             )}
 
             {!isOwner && (
               <>
-                <ReceiptForm
+                <QuickActions
+                  shopId={shopId}
                   product={line.product}
-                  isPending={receiptMutation.isPending}
-                  error={receiptMutation.error}
-                  isSuccess={
-                    receiptMutation.isSuccess &&
-                    receiptMutation.variables?.productId === line.product.id
-                  }
-                  onSubmit={(payload) =>
-                    receiptMutation.mutate({ shopId, productId: line.product.id, ...payload })
+                  isReceiptOpen={openReceiptProductId === line.product.id}
+                  onToggleReceipt={() =>
+                    setOpenReceiptProductId(openReceiptProductId === line.product.id ? null : line.product.id)
                   }
                 />
-                <Link
-                  to={`/shops/${shopId}/products/${line.product.id}/daily-report`}
-                  className="mt-2 block rounded-md border border-slate-300 px-3 py-2 text-center text-sm font-medium text-slate-700"
-                >
-                  Submit daily report
-                </Link>
+                {openReceiptProductId === line.product.id && (
+                  <div className="rounded-xl border border-slate-200 bg-white p-3">
+                    <ReceiptForm
+                      product={line.product}
+                      isPending={receiptMutation.isPending}
+                      error={receiptMutation.error}
+                      isSuccess={
+                        receiptMutation.isSuccess &&
+                        receiptMutation.variables?.productId === line.product.id
+                      }
+                      onSubmit={(payload) =>
+                        receiptMutation.mutate({ shopId, productId: line.product.id, ...payload })
+                      }
+                    />
+                  </div>
+                )}
               </>
             )}
           </div>
         ))}
       </div>
+
+      {isOwner && <ShopStaffSection shopId={shopId} />}
     </div>
   );
 }

@@ -3,6 +3,7 @@ import { useQuery, useQueries } from '@tanstack/react-query';
 import { fetchShops } from '../api/shops.js';
 import { fetchShopInventory } from '../api/inventory.js';
 import { fetchPendingReceipts } from '../api/stockReceipts.js';
+import { ShopCard } from '../components/ShopCard.jsx';
 
 export function OwnerHomePage() {
   const shopsQuery = useQuery({ queryKey: ['shops'], queryFn: fetchShops });
@@ -24,6 +25,13 @@ export function OwnerHomePage() {
   }
 
   const pendingCount = pendingQuery.data?.length ?? null;
+  // Derived client-side from the same pending-receipts fetch used by the
+  // banner below — no extra request per shop.
+  const pendingCountByShop = (pendingQuery.data || []).reduce((counts, receipt) => {
+    const id = receipt.shopId?._id;
+    if (id) counts[id] = (counts[id] || 0) + 1;
+    return counts;
+  }, {});
 
   return (
     <div className="space-y-4">
@@ -39,31 +47,20 @@ export function OwnerHomePage() {
         <p className="text-xs text-amber-700">Tap to review</p>
       </Link>
 
-      <div className="space-y-2">
-        {shops.length === 0 && <p className="text-sm text-slate-500">No shops yet.</p>}
-        {shops.map((shop, index) => {
-          const inv = inventoryQueries[index];
-          const firstLine = inv?.data?.inventory?.[0];
-          return (
-            <Link
+      {shops.length === 0 ? (
+        <p className="text-sm text-slate-500">No shops yet.</p>
+      ) : (
+        <div className="grid grid-cols-1 min-[360px]:grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-3">
+          {shops.map((shop, index) => (
+            <ShopCard
               key={shop._id}
-              to={`/shops/${shop._id}`}
-              className="block rounded-lg border border-slate-200 bg-white px-4 py-3"
-            >
-              <div className="flex items-center justify-between">
-                <span className="font-medium text-slate-900">{shop.name}</span>
-                <span className="text-sm text-slate-500">
-                  {inv?.isLoading && 'Loading...'}
-                  {inv?.isError && 'Unavailable'}
-                  {firstLine && `${firstLine.balance} ${firstLine.product.unit}`}
-                  {inv?.isSuccess && !firstLine && 'No products'}
-                </span>
-              </div>
-              <p className="text-xs text-slate-400">{shop.code}</p>
-            </Link>
-          );
-        })}
-      </div>
+              shop={shop}
+              stockQuery={inventoryQueries[index]}
+              pendingCount={pendingCountByShop[shop._id] ?? 0}
+            />
+          ))}
+        </div>
+      )}
 
       <Link to="/receipts" className="block text-center text-sm text-slate-500 underline">
         View stock receipt history

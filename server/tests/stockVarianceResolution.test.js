@@ -471,7 +471,7 @@ describe('DailySalesReport immutability (stock variance resolutions)', () => {
     const reportId = submitRes.body.data.report._id;
     const ownerAgent = await loginAgent(app, 'owner@test.dev');
 
-    const before = await DailySalesReport.findById(reportId).lean();
+    const before = (await DailySalesReport.findById(reportId)).toObject();
 
     const createRes = await ownerAgent.post(`/api/daily-reports/${reportId}/stock-variance-resolutions`).send({
       resolutionType: 'DAMAGE',
@@ -484,7 +484,7 @@ describe('DailySalesReport immutability (stock variance resolutions)', () => {
       .post(`/api/stock-variance-resolutions/${createRes.body.data.resolution._id}/reverse`)
       .send({ reason: 'undo' });
 
-    const after = await DailySalesReport.findById(reportId).lean();
+    const after = (await DailySalesReport.findById(reportId)).toObject();
     expect(after).toEqual(before);
     expect(after).not.toHaveProperty('resolvedStockVarianceMagnitude');
     expect(after).not.toHaveProperty('resolvedMoneyVarianceMagnitudeKobo');
@@ -578,5 +578,65 @@ describe('Reserved vs active state transitions', () => {
 
     const stillProcessing = await StockVarianceResolution.findById(stranded._id);
     expect(stillProcessing.status).toBe('PROCESSING');
+  });
+});
+
+describe('Business-truth aggregation source', () => {
+  it('resolvedStockVarianceMagnitude counts only ACTIVE resolutions for the current effective version — never REVERSED or PROCESSING', async () => {
+    const { shopA, product, owner } = await setupShopWithUsers();
+    const sales = await loginAgent(app, 'sales@test.dev');
+    const submitRes = await submitNegativeVarianceReport(sales, shopA, product, owner); // variance -3
+    const reportId = submitRes.body.data.report._id;
+    const ownerAgent = await loginAgent(app, 'owner@test.dev');
+
+    // One real ACTIVE resolution (quantity 1).
+    const activeRes = await ownerAgent.post(`/api/daily-reports/${reportId}/stock-variance-resolutions`).send({
+      resolutionType: 'DAMAGE',
+      quantity: 1,
+      reason: 'real active resolution',
+    });
+    expect(activeRes.status).toBe(201);
+
+    // A REVERSED resolution inserted directly (simulates history from an
+    // earlier, already-undone resolution).
+    await StockVarianceResolution.create({
+      dailySalesReportId: reportId,
+      dailySalesCorrectionId: null,
+      shopId: shopA._id,
+      productId: product._id,
+      sourceBusinessDate: '2020-01-10',
+      resolutionType: 'DAMAGE',
+      quantity: 5,
+      direction: 'OUT',
+      reason: 'historical, already reversed',
+      status: 'REVERSED',
+      resolvedBy: owner._id,
+      postingBusinessDate: '2020-01-10',
+    });
+
+    // A PROCESSING resolution inserted directly (simulates a crash-stranded
+    // in-flight attempt).
+    await StockVarianceResolution.create({
+      dailySalesReportId: reportId,
+      dailySalesCorrectionId: null,
+      shopId: shopA._id,
+      productId: product._id,
+      sourceBusinessDate: '2020-01-10',
+      resolutionType: 'DAMAGE',
+      quantity: 9,
+      direction: 'OUT',
+      reason: 'crash-stranded, still processing',
+      status: 'PROCESSING',
+      resolvedBy: owner._id,
+      postingBusinessDate: '2020-01-10',
+    });
+
+    const effectiveRes = await ownerAgent.get(`/api/daily-reports/${reportId}/effective`);
+    // Only the one real ACTIVE resolution (quantity 1) counts — the
+    // REVERSED (5) and PROCESSING (9) records are excluded entirely.
+    expect(effectiveRes.body.data.resolvedStockVarianceMagnitude).toBe(1);
+    expect(effectiveRes.body.data.unresolvedStockVarianceQuantity).toBe(-2);
+    // All three remain visible in history.
+    expect(effectiveRes.body.data.stockResolutions).toHaveLength(3);
   });
 });

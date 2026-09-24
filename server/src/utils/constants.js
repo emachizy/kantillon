@@ -74,7 +74,23 @@ export const AUDIT_ACTIONS = Object.freeze({
   STOCK_VARIANCE_RESOLUTION_REVERSED: 'STOCK_VARIANCE_RESOLUTION_REVERSED',
   MONEY_VARIANCE_RESOLVED: 'MONEY_VARIANCE_RESOLVED',
   MONEY_VARIANCE_RESOLUTION_REVERSED: 'MONEY_VARIANCE_RESOLUTION_REVERSED',
+  USER_CREATED: 'USER_CREATED',
+  USER_UPDATED: 'USER_UPDATED',
+  USER_SHOPS_UPDATED: 'USER_SHOPS_UPDATED',
+  USER_DEACTIVATED: 'USER_DEACTIVATED',
+  USER_REACTIVATED: 'USER_REACTIVATED',
+  USER_PASSWORD_RESET: 'USER_PASSWORD_RESET',
+  SHOP_CREATED: 'SHOP_CREATED',
+  SHOP_UPDATED: 'SHOP_UPDATED',
+  SHOP_DEACTIVATED: 'SHOP_DEACTIVATED',
+  SHOP_REACTIVATED: 'SHOP_REACTIVATED',
 });
+
+// Roles an OWNER may assign through the staff-management API — deliberately
+// excludes OWNER itself. The one-time bootstrap script (src/scripts/
+// bootstrapOwner.js) is the only way a new OWNER account is ever created;
+// see README "Who may create another OWNER".
+export const ASSIGNABLE_STAFF_ROLES = Object.freeze([ROLES.ADMIN, ROLES.MANAGER, ROLES.SALESPERSON]);
 
 // A DailySalesReport is immutable once submitted in Phase 3 — this single
 // status exists so a future reversal/correction workflow has somewhere to

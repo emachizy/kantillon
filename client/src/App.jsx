@@ -8,8 +8,16 @@ import { DailyReportFormPage } from './pages/DailyReportFormPage.jsx';
 import { DailyReportDetailPage } from './pages/DailyReportDetailPage.jsx';
 import { CorrectionRequestFormPage } from './pages/CorrectionRequestFormPage.jsx';
 import { OwnerDailySummaryPage } from './pages/OwnerDailySummaryPage.jsx';
+import { UsersStaffPage } from './pages/UsersStaffPage.jsx';
+import { AddUserPage } from './pages/AddUserPage.jsx';
+import { UserDetailPage } from './pages/UserDetailPage.jsx';
+import { ChangePasswordPage } from './pages/ChangePasswordPage.jsx';
+import { ShopsManagePage } from './pages/ShopsManagePage.jsx';
+import { AddShopPage } from './pages/AddShopPage.jsx';
+import { ManageShopPage } from './pages/ManageShopPage.jsx';
 import { AppShell } from './components/AppShell.jsx';
 import { ProtectedRoute } from './routes/ProtectedRoute.jsx';
+import { OwnerRoute } from './routes/OwnerRoute.jsx';
 
 export default function App() {
   return (
@@ -17,6 +25,8 @@ export default function App() {
       <Route path="/login" element={<LoginPage />} />
 
       <Route element={<ProtectedRoute />}>
+        <Route path="/change-password" element={<ChangePasswordPage />} />
+
         <Route element={<AppShell />}>
           <Route path="/" element={<HomePage />} />
           <Route path="/shops/:shopId" element={<ShopInventoryPage />} />
@@ -29,6 +39,17 @@ export default function App() {
           <Route path="/daily-summary" element={<OwnerDailySummaryPage />} />
           <Route path="/approvals" element={<PendingApprovalsPage />} />
           <Route path="/receipts" element={<ReceiptHistoryPage />} />
+          {/* OWNER-only pages — OwnerRoute redirects non-owners to "/" as a
+              UX guard; the backend still enforces requireRole(OWNER) on
+              every one of these requests regardless. */}
+          <Route element={<OwnerRoute />}>
+            <Route path="/users" element={<UsersStaffPage />} />
+            <Route path="/users/new" element={<AddUserPage />} />
+            <Route path="/users/:id" element={<UserDetailPage />} />
+            <Route path="/shops/manage" element={<ShopsManagePage />} />
+            <Route path="/shops/manage/new" element={<AddShopPage />} />
+            <Route path="/shops/manage/:shopId" element={<ManageShopPage />} />
+          </Route>
         </Route>
       </Route>
 

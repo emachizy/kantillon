@@ -9,6 +9,7 @@ import {
   variantReportPayload,
 } from './dailyReportFixtures.js';
 import { ROLES } from '../src/utils/constants.js';
+import { DailySalesReport } from '../src/models/DailySalesReport.js';
 import { AuditLog } from '../src/models/AuditLog.js';
 import { InventoryTransaction } from '../src/models/InventoryTransaction.js';
 import { DailySalesCorrection } from '../src/models/DailySalesCorrection.js';
@@ -939,7 +940,7 @@ describe('Resolution-state effective-version isolation', () => {
     );
     const reportId = submitRes.body.data.report._id;
 
-    // Resolve DAMAGE 2 -> ACTIVE.
+    // Resolve DAMAGE 2 -> ACTIVE. resolved = 2, remaining = -3.
     const damageRes = await ownerAgent.post(`/api/daily-reports/${reportId}/stock-variance-resolutions`).send({
       resolutionType: 'DAMAGE',
       quantity: 2,
@@ -949,14 +950,20 @@ describe('Resolution-state effective-version isolation', () => {
     let state = await DailyReportResolutionState.findOne({ dailySalesReportId: reportId });
     expect(state.activeStockVarianceMagnitude).toBe(2);
     expect(state.reservedStockVarianceMagnitude).toBe(0);
+    let effectiveRes = await ownerAgent.get(`/api/daily-reports/${reportId}/effective`);
+    expect(effectiveRes.body.data.resolvedStockVarianceMagnitude).toBe(2);
+    expect(effectiveRes.body.data.unresolvedStockVarianceQuantity).toBe(-3);
 
-    // Reverse DAMAGE 2 -> both zero again.
+    // Reverse DAMAGE 2 -> both zero again. resolved = 0, remaining = -5.
     await ownerAgent
       .post(`/api/stock-variance-resolutions/${damageRes.body.data.resolution._id}/reverse`)
       .send({ reason: 'undo' });
     state = await DailyReportResolutionState.findOne({ dailySalesReportId: reportId });
     expect(state.activeStockVarianceMagnitude).toBe(0);
     expect(state.reservedStockVarianceMagnitude).toBe(0);
+    effectiveRes = await ownerAgent.get(`/api/daily-reports/${reportId}/effective`);
+    expect(effectiveRes.body.data.resolvedStockVarianceMagnitude).toBe(0);
+    expect(effectiveRes.body.data.unresolvedStockVarianceQuantity).toBe(-5);
 
     // Approve a correction whose new variance is -3 (same 400 sold,
     // physical recount now says 1097 instead of 1095).
@@ -979,8 +986,16 @@ describe('Resolution-state effective-version isolation', () => {
     expect(state.activeStockVarianceMagnitude).toBe(0);
     expect(state.reservedStockVarianceMagnitude).toBe(0);
 
-    const effectiveRes = await ownerAgent.get(`/api/daily-reports/${reportId}/effective`);
+    // Current effective report: resolved = 0, remaining = -3. The
+    // historical DAMAGE/REVERSED resolution against the ORIGINAL version
+    // remains visible in history but does not count against the corrected
+    // version's discrepancy.
+    effectiveRes = await ownerAgent.get(`/api/daily-reports/${reportId}/effective`);
+    expect(effectiveRes.body.data.resolvedStockVarianceMagnitude).toBe(0);
     expect(effectiveRes.body.data.unresolvedStockVarianceQuantity).toBe(-3);
+    expect(effectiveRes.body.data.stockResolutions).toHaveLength(1);
+    expect(effectiveRes.body.data.stockResolutions[0].status).toBe('REVERSED');
+    expect(effectiveRes.body.data.stockResolutions[0].quantity).toBe(2);
   });
 });
 
@@ -1044,5 +1059,28 @@ describe('Correction ledger business date (cross-day)', () => {
       approveRes.body.data.correction.replacementSaleInventoryTransactionId
     );
     expect(replacement.businessDate).toBe('2020-01-10');
+  });
+});
+
+describe('DailySalesReport immutability (correction approval)', () => {
+  it('never modifies the original DailySalesReport document — a correction only ever creates a new DailySalesCorrection', async () => {
+    const { shopA, product, owner } = await setupShopWithUsers();
+    const sales = await loginAgent(app, 'sales@test.dev');
+    const submitRes = await submitCleanReport(sales, shopA, product, owner);
+    const reportId = submitRes.body.data.report._id;
+
+    const before = (await DailySalesReport.findById(reportId)).toObject();
+
+    const reqRes = await sales.post(`/api/daily-reports/${reportId}/corrections`).send(correctionPayload());
+    const ownerAgent = await loginAgent(app, 'owner@test.dev');
+    const approveRes = await ownerAgent.post(`/api/correction-requests/${reqRes.body.data.request._id}/approve`);
+    expect(approveRes.status).toBe(200);
+
+    const after = (await DailySalesReport.findById(reportId)).toObject();
+    expect(after).toEqual(before);
+
+    // The correction is a wholly separate document.
+    const correctionCount = await DailySalesCorrection.countDocuments({ dailySalesReportId: reportId });
+    expect(correctionCount).toBe(1);
   });
 });

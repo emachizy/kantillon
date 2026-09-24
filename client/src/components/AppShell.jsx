@@ -41,6 +41,16 @@ export function AppShell() {
             Daily Summary
           </NavLink>
         )}
+        {isOwner && (
+          <NavLink to="/shops/manage" className={navLinkClass}>
+            Shops
+          </NavLink>
+        )}
+        {isOwner && (
+          <NavLink to="/users" className={navLinkClass}>
+            Users
+          </NavLink>
+        )}
         <NavLink to="/receipts" className={navLinkClass}>
           History
         </NavLink>
