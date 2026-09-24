@@ -15,6 +15,9 @@ import { ChangePasswordPage } from './pages/ChangePasswordPage.jsx';
 import { ShopsManagePage } from './pages/ShopsManagePage.jsx';
 import { AddShopPage } from './pages/AddShopPage.jsx';
 import { ManageShopPage } from './pages/ManageShopPage.jsx';
+import { ProductsManagePage } from './pages/ProductsManagePage.jsx';
+import { AddProductPage } from './pages/AddProductPage.jsx';
+import { ManageProductPage } from './pages/ManageProductPage.jsx';
 import { AppShell } from './components/AppShell.jsx';
 import { ProtectedRoute } from './routes/ProtectedRoute.jsx';
 import { OwnerRoute } from './routes/OwnerRoute.jsx';
@@ -49,6 +52,9 @@ export default function App() {
             <Route path="/shops/manage" element={<ShopsManagePage />} />
             <Route path="/shops/manage/new" element={<AddShopPage />} />
             <Route path="/shops/manage/:shopId" element={<ManageShopPage />} />
+            <Route path="/products/manage" element={<ProductsManagePage />} />
+            <Route path="/products/manage/new" element={<AddProductPage />} />
+            <Route path="/products/manage/:productId" element={<ManageProductPage />} />
           </Route>
         </Route>
       </Route>

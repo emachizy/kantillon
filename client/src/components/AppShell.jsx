@@ -1,8 +1,15 @@
 import { NavLink, Outlet } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext.jsx';
 
+// min-w-0 lets these actually shrink below their content width instead of
+// overflowing the fixed bottom bar — flex items default to min-width:auto,
+// and with 7 tabs for OWNER (the most this bar has ever carried) that
+// default caused the last couple of tabs to be pushed off-screen entirely
+// on a narrow phone rather than wrapping like "Daily Summary" already did.
 const navLinkClass = ({ isActive }) =>
-  `flex-1 py-2 text-center text-sm font-medium ${isActive ? 'text-slate-900' : 'text-slate-400'}`;
+  `flex-1 min-w-0 px-0.5 py-2 text-center text-[11px] leading-tight font-medium ${
+    isActive ? 'text-slate-900' : 'text-slate-400'
+  }`;
 
 // Mobile-first shell: a slim top bar, content area, and a bottom tab bar —
 // enough navigation to operate Phase 2's workflow, not the final dashboard.
@@ -44,6 +51,11 @@ export function AppShell() {
         {isOwner && (
           <NavLink to="/shops/manage" className={navLinkClass}>
             Shops
+          </NavLink>
+        )}
+        {isOwner && (
+          <NavLink to="/products/manage" className={navLinkClass}>
+            Products
           </NavLink>
         )}
         {isOwner && (

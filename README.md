@@ -498,8 +498,11 @@ Kantillon has **no public sign-up**. `npm run seed` refuses to run against produ
    ```
 6. Log into Kantillon with that email and password.
 7. Create your shop(s) from **Shops** (`/shops/manage`) — a fresh production database starts with zero shops too, so this comes before staff onboarding.
-8. Create every further staff account from **Users & Staff**, assigning each one to the shop(s) they should see — never by running this script again for anyone but the very first owner.
-9. Staff log in with the temporary password the OWNER gave them, and are prompted to set their own on first login.
+8. Create your product(s) from **Products** (`/products/manage`) — a fresh database also starts with zero products, which is why a shop page shows "No products configured yet" until this step.
+9. Set each product's price per shop, either from the product's **Manage Product** page ("Shop Prices") or the shop's **Manage Shop** page ("Products & Prices") — both write to the same price record, so it doesn't matter which screen you use.
+10. Initialize **Opening Stock** for each shop/product from that shop's operational page — this is still the same one-time, ledger-based initialization from earlier phases, unchanged by product management.
+11. Create every further staff account from **Users & Staff**, assigning each one to the shop(s) they should see — never by running the bootstrap script again for anyone but the very first owner.
+12. Staff log in with the temporary password the OWNER gave them, are prompted to set their own on first login, and can then see the shop(s) they were assigned, the products configured for them, and their current prices.
 
 Unlike `npm run seed`, this script **runs fine with `NODE_ENV=production`** — that's the point of it. It never wipes any collection, hashes the password with the exact same `User.hashPassword` bcrypt logic every other account uses, and refuses (non-zero exit, no partial write) if the email already exists — so re-running it by accident is safe, not destructive. No real credentials are ever hardcoded in the script or committed to the repo; everything comes from the environment variables you supply at run time.
 
@@ -514,6 +517,17 @@ There is no self-registration anywhere in Kantillon — the login page only ever
 - **Inactive users cannot log in** — `authenticate()` checks `isActive` before even comparing the password, with the same "invalid email or password" message used for a wrong password, so deactivation can't be detected by an outside login attempt either.
 - **OWNER has global shop access** regardless of `shopIds` (enforced in `services/shopAccessService.js`, unchanged by this feature). **MANAGER** and **SALESPERSON** access comes entirely from their `shopIds` array — assign or remove a shop and their access changes immediately, enforced server-side on every request (`requireShopAccess` middleware), never something the frontend can widen by itself.
 - New staff accounts are created with `mustChangePassword: true`; the frontend redirects them to `/change-password` on first login. This is the one deliberately optional piece from the original request that *was* implemented (see "Assumptions" below) rather than skipped, since it turned out to be a small, self-contained addition (`POST /api/auth/change-password`, which — unlike an OWNER-driven reset — always verifies the current password first) that didn't touch the existing login flow at all.
+
+### Product and shop-price management
+
+- **OWNER** creates products from **Products** (`/products/manage`) — name is the only required field; `unit` defaults to `"bag"` if left blank. A product's `sku` (the same kind of unique code `Product` already required before this feature existed) is generated automatically from the name, exactly like a shop's `code`.
+- **Products are never hard-deleted** — deactivating one (from its Manage Product page) sets `isActive: false` and preserves every historical inventory transaction, stock receipt, daily report, `ShopPrice` row, and audit entry that references it. An inactive product simply stops appearing in `GET /api/products` (default) and therefore in every shop's operational inventory list, exactly as an inactive shop does — reactivating brings it back everywhere immediately.
+- Products were never shop-scoped and still aren't: there is no shop-product assignment table. Every shop's operational page has always shown *every active product*, combined with that shop's own inventory balance and price — so the moment the OWNER creates an active product, it appears in every shop automatically. Before this feature, the only way a product ever existed was via `npm run seed`; there was no OWNER workflow to create one, which is exactly why a fresh shop's page said "No products configured."
+- **Prices are per shop, per product, and historical, never overwritten in place** — this was already true of the `ShopPrice` model from an earlier phase; this feature only adds the missing OWNER-facing write path (`POST /api/shop-prices`, OWNER only). Setting a price closes out whatever price was previously active for that shop/product (`effectiveTo` set to now) and inserts a brand-new active row — the old row is never deleted or edited, so a `DailySalesReport`'s stored `unitPriceKobo` for a past sale is never affected by a later price change. Only one active (`effectiveTo: null`) price can ever exist per shop/product, enforced by a database-level partial unique index, not just application logic.
+- Prices are stored and transmitted as **integer kobo only** (1 Naira = 100 kobo) — `priceKobo: 1200000` means ₦12,000.00. The frontend never stores or calculates a floating-point Naira value; it converts for display/input only, via the same string-based helpers (`client/src/utils/money.js`) already used elsewhere in the app.
+- Setting a price requires both the shop and the product to be **active** — you cannot price a deactivated shop or a deactivated product; reactivate it first.
+- Price management is available from two equivalent screens that both call the exact same backend logic: the product's **Manage Product** page ("Shop Prices" — one product, every shop) and the shop's **Manage Shop** page ("Products & Prices" — one shop, every active product). Neither is a separate system; both read/write the same `ShopPrice` rows.
+- **Opening stock is unchanged** — it is still the same one-time, ledger-based, OWNER-only initialization from Phase 2. Product management doesn't touch its rules; it just makes a real product available for it to reference.
 
 ## Tests
 
@@ -589,7 +603,7 @@ Phase 4 additions (82 new tests across `dailyReportCorrection.test.js`, `stockVa
 - `POST /api/auth/logout`
 - `GET /api/auth/me`
 - `GET /api/shops` — active shops only; OWNER sees all of them, everyone else sees only shops in their `shopIds`. OWNER may add `?includeInactive=true` to also see deactivated shops.
-- `GET /api/products` — not shop-scoped, visible to any authenticated user
+- `GET /api/products` — active products only, not shop-scoped, visible to any authenticated user; OWNER may add `?includeInactive=true` to also see deactivated products.
 
 **Phase 2:** see "Inventory & stock-receipt API summary" above for the full list (`/api/inventory/opening-stock`, `/api/inventory/shop/:shopId`, `/api/stock-receipts` and its sub-routes).
 
@@ -626,6 +640,21 @@ No edit or delete endpoint exists for any Phase 4 resource — corrections and r
 | `GET /api/shops/:shopId/staff` | OWNER only |
 
 Shops are never hard-deleted (see "How staff onboarding works from there" above).
+
+**Owner product and shop-price management:**
+
+| Endpoint | Access |
+| --- | --- |
+| `POST /api/products` | OWNER only |
+| `GET /api/products/:productId` | Any authenticated user |
+| `PATCH /api/products/:productId` | OWNER only |
+| `POST /api/products/:productId/deactivate` | OWNER only |
+| `POST /api/products/:productId/reactivate` | OWNER only |
+| `POST /api/shop-prices` | OWNER only — sets the current price for a shop/product; both shop and product must be active |
+| `GET /api/shop-prices/product/:productId/current` | OWNER only — every active shop's current price for one product, in one query |
+| `GET /api/shop-prices/shop/:shopId/current` | OWNER only — every active product's current price for one shop, in one query |
+
+Products are never hard-deleted, and a `ShopPrice` row is never updated in place (see "Product and shop-price management" above).
 
 ## Frontend (mobile-first)
 

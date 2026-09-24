@@ -2,7 +2,9 @@ import { useEffect, useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { fetchShop, updateShop, deactivateShop, reactivateShop } from '../api/shops.js';
+import { fetchCurrentPricesForShop, setShopPrice } from '../api/shopPrices.js';
 import { ShopStaffSection } from '../components/ShopStaffSection.jsx';
+import { ShopPriceRow } from '../components/ShopPriceRow.jsx';
 
 function errorMessage(error, fallback) {
   const details = error?.response?.data?.details;
@@ -14,6 +16,10 @@ export function ManageShopPage() {
   const { shopId } = useParams();
   const queryClient = useQueryClient();
   const shopQuery = useQuery({ queryKey: ['shops', shopId], queryFn: () => fetchShop(shopId) });
+  const pricesQuery = useQuery({
+    queryKey: ['shop-prices', 'shop', shopId],
+    queryFn: () => fetchCurrentPricesForShop(shopId),
+  });
 
   const [name, setName] = useState('');
   const [address, setAddress] = useState('');
@@ -38,6 +44,10 @@ export function ManageShopPage() {
   const updateMutation = useMutation({ mutationFn: updateShop, onSuccess: invalidate });
   const deactivateMutation = useMutation({ mutationFn: deactivateShop, onSuccess: invalidate });
   const reactivateMutation = useMutation({ mutationFn: reactivateShop, onSuccess: invalidate });
+  const priceMutation = useMutation({
+    mutationFn: setShopPrice,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['shop-prices'] }),
+  });
 
   if (shopQuery.isLoading) {
     return <p className="text-sm text-slate-500">Loading shop...</p>;
@@ -160,6 +170,31 @@ export function ManageShopPage() {
           {updateMutation.isPending ? 'Saving...' : 'Save changes'}
         </button>
       </form>
+
+      <div className="space-y-2">
+        <h2 className="text-xs font-semibold uppercase tracking-wide text-slate-400">Products & Prices</h2>
+        <div className="rounded-xl border border-slate-200 bg-white p-3">
+          {pricesQuery.isLoading && <p className="text-sm text-slate-500">Loading prices...</p>}
+          {pricesQuery.isSuccess && pricesQuery.data.length === 0 && (
+            <p className="text-sm text-slate-500">No active products yet.</p>
+          )}
+          {(pricesQuery.data || []).map((row) => (
+            <ShopPriceRow
+              key={row.product.id}
+              label={row.product.name}
+              priceKobo={row.priceKobo}
+              isPending={priceMutation.isPending}
+              error={priceMutation.isError ? priceMutation.error : null}
+              onSave={(priceKobo, onDone) =>
+                priceMutation.mutate(
+                  { shopId: shop._id, productId: row.product.id, priceKobo },
+                  { onSuccess: onDone }
+                )
+              }
+            />
+          ))}
+        </div>
+      </div>
 
       <ShopStaffSection shopId={shop._id} />
 

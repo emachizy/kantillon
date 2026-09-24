@@ -212,7 +212,18 @@ export function ShopInventoryPage() {
         </div>
       )}
 
-      {inventory.length === 0 && <p className="text-sm text-slate-500">No products configured.</p>}
+      {inventory.length === 0 && (
+        <div className="space-y-1 text-sm text-slate-500">
+          <p>No products configured yet.</p>
+          {isOwner ? (
+            <Link to="/products/manage/new" className="inline-block font-medium text-slate-600 underline">
+              Create Product
+            </Link>
+          ) : (
+            <p>Contact the owner.</p>
+          )}
+        </div>
+      )}
 
       <div className="space-y-5">
         {inventory.map((line) => (
