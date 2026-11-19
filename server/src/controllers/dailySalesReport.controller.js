@@ -2,6 +2,7 @@ import {
   submitDailySalesReport,
   listDailySalesReports,
   getDailySalesReportById,
+  getMonthlySummary,
 } from '../services/dailySalesReportService.js';
 import { getAccessibleShopIds, canAccessShop } from '../services/shopAccessService.js';
 import { ApiError } from '../utils/ApiError.js';
@@ -75,4 +76,11 @@ export const getDailySummary = catchAsync(async (req, res) => {
   const { businessDate } = req.query;
   const reports = await listDailySalesReports({ businessDate });
   sendSuccess(res, { data: { businessDate, reports } });
+});
+
+// OWNER-only cross-shop rollup for one calendar month.
+export const getMonthlySummaryHandler = catchAsync(async (req, res) => {
+  const { month } = req.query;
+  const rows = await getMonthlySummary(month);
+  sendSuccess(res, { data: { month, rows } });
 });

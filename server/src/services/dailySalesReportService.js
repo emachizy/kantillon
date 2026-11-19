@@ -292,3 +292,75 @@ export async function getDailySalesReportById(id) {
   if (!report) throw ApiError.notFound('Daily sales report not found');
   return report;
 }
+
+// businessDate strings (YYYY-MM-DD) sort correctly as plain strings (see
+// utils/businessDate.js), so a calendar month is just the half-open range
+// [month-01, nextMonth-01) — no timezone-aware date math needed here, this
+// is a label on already-Lagos-resolved businessDate strings, not an
+// instant.
+function monthRange(month) {
+  const [year, mon] = month.split('-').map(Number);
+  const start = `${month}-01`;
+  const end = mon === 12 ? `${year + 1}-01-01` : `${year}-${String(mon + 1).padStart(2, '0')}-01`;
+  return { start, end };
+}
+
+// Owner-only, cross-shop monthly rollup: every shop/product combination
+// with at least one submitted report in the month, summed. Reuses raw
+// (as-submitted) report fields — the same level of correction-awareness
+// the existing per-day summary (getDailySummary) already uses; it does not
+// read the "effective" (post-correction) values the single-report detail
+// page shows. Two extra queries (not one per row) fetch shop/product names
+// for display, matching the existing getShopInventory /
+// getCurrentPricesForProduct pattern elsewhere in this codebase.
+export async function getMonthlySummary(month) {
+  const { start, end } = monthRange(month);
+
+  const rows = await DailySalesReport.aggregate([
+    { $match: { businessDate: { $gte: start, $lt: end } } },
+    {
+      $group: {
+        _id: { shopId: '$shopId', productId: '$productId' },
+        totalQuantitySold: { $sum: '$totalQuantitySold' },
+        expectedRevenueKobo: { $sum: '$expectedRevenueKobo' },
+        actualAmountCollectedKobo: { $sum: '$actualAmountCollectedKobo' },
+        moneyVarianceKobo: { $sum: '$moneyVarianceKobo' },
+        stockVarianceQuantity: { $sum: '$stockVarianceQuantity' },
+        reportCount: { $sum: 1 },
+      },
+    },
+  ]);
+
+  if (rows.length === 0) return [];
+
+  const shopIds = [...new Set(rows.map((row) => row._id.shopId.toString()))];
+  const productIds = [...new Set(rows.map((row) => row._id.productId.toString()))];
+
+  const [shops, products] = await Promise.all([
+    Shop.find({ _id: { $in: shopIds } }).select('name code'),
+    Product.find({ _id: { $in: productIds } }).select('name unit'),
+  ]);
+  const shopById = new Map(shops.map((shop) => [shop._id.toString(), shop]));
+  const productById = new Map(products.map((product) => [product._id.toString(), product]));
+
+  return rows
+    .map((row) => {
+      const shop = shopById.get(row._id.shopId.toString());
+      const product = productById.get(row._id.productId.toString());
+      return {
+        shop: shop ? { id: shop._id, name: shop.name, code: shop.code } : null,
+        product: product ? { id: product._id, name: product.name, unit: product.unit } : null,
+        totalQuantitySold: row.totalQuantitySold,
+        expectedRevenueKobo: row.expectedRevenueKobo,
+        actualAmountCollectedKobo: row.actualAmountCollectedKobo,
+        moneyVarianceKobo: row.moneyVarianceKobo,
+        stockVarianceQuantity: row.stockVarianceQuantity,
+        reportCount: row.reportCount,
+      };
+    })
+    .sort(
+      (a, b) =>
+        (a.shop?.name || '').localeCompare(b.shop?.name || '') ||
+        (a.product?.name || '').localeCompare(b.product?.name || '')
+    );
+}

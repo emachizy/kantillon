@@ -4,6 +4,7 @@ import {
   getDailySalesReports,
   getDailySalesReportByIdHandler,
   getDailySummary,
+  getMonthlySummaryHandler,
 } from '../controllers/dailySalesReport.controller.js';
 import {
   postCorrectionRequest,
@@ -25,6 +26,7 @@ import {
   idParamSchema,
   listDailySalesReportsQuerySchema,
   dailySummaryQuerySchema,
+  monthlySummaryQuerySchema,
 } from '../validators/dailySalesReport.validators.js';
 import { createCorrectionRequestSchema } from '../validators/dailyReportCorrection.validators.js';
 import { createStockVarianceResolutionSchema } from '../validators/stockVarianceResolution.validators.js';
@@ -46,13 +48,21 @@ router.post(
 );
 
 // Must be registered before GET '/:id' — otherwise Express would match
-// "/summary" as an :id value.
+// "/summary" / "/monthly-summary" as an :id value.
 router.get(
   '/summary',
   requireAuth,
   requireRole(ROLES.OWNER),
   validate(dailySummaryQuerySchema, 'query'),
   getDailySummary
+);
+
+router.get(
+  '/monthly-summary',
+  requireAuth,
+  requireRole(ROLES.OWNER),
+  validate(monthlySummaryQuerySchema, 'query'),
+  getMonthlySummaryHandler
 );
 
 router.get(

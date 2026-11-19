@@ -46,3 +46,13 @@ export const listDailySalesReportsQuerySchema = z.object({
 export const dailySummaryQuerySchema = z.object({
   businessDate: businessDateSchema,
 });
+
+export const monthlySummaryQuerySchema = z.object({
+  month: z
+    .string()
+    .regex(/^\d{4}-\d{2}$/, 'month must be in YYYY-MM format')
+    .refine((v) => {
+      const mon = Number(v.slice(5, 7));
+      return mon >= 1 && mon <= 12;
+    }, 'month must be between 01 and 12'),
+});

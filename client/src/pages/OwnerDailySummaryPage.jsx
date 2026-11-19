@@ -27,7 +27,12 @@ export function OwnerDailySummaryPage() {
 
   return (
     <div className="space-y-4">
-      <h1 className="text-lg font-semibold text-slate-900">Daily reconciliation summary</h1>
+      <div className="flex items-center justify-between">
+        <h1 className="text-lg font-semibold text-slate-900">Daily reconciliation summary</h1>
+        <Link to="/monthly-summary" className="text-xs font-medium text-slate-500">
+          Monthly view →
+        </Link>
+      </div>
 
       <input
         type="date"

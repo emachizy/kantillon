@@ -810,6 +810,91 @@ describe('GET /api/daily-reports/summary', () => {
   });
 });
 
+describe('GET /api/daily-reports/monthly-summary', () => {
+  it('is OWNER-only', async () => {
+    const { shopA, product, owner } = await setup();
+    await createOpeningStockDirect(shopA, product, owner, 1000, '2020-02-10');
+    const sales = await loginAgent(app, 'sales@test.dev');
+
+    const res = await sales.get('/api/daily-reports/monthly-summary?month=2020-02');
+    expect(res.status).toBe(403);
+  });
+
+  it('rejects a malformed month', async () => {
+    const { shopA, product, owner } = await setup();
+    await createOpeningStockDirect(shopA, product, owner, 1000, '2020-02-10');
+    const ownerAgent = await loginAgent(app, 'owner@test.dev');
+
+    const res = await ownerAgent.get('/api/daily-reports/monthly-summary?month=2020-13');
+    expect(res.status).toBe(400);
+  });
+
+  it('sums every report in the month for a shop/product, and excludes neighboring months', async () => {
+    const { shopA, product, owner } = await setup();
+    await createOpeningStockDirect(shopA, product, owner, 1000, '2020-01-31');
+    const sales = await loginAgent(app, 'sales@test.dev');
+
+    // Day before the month starts — must not be counted.
+    await sales
+      .post('/api/daily-reports')
+      .send(reportPayload(shopA, product, { businessDate: '2020-01-31' }));
+    // Three days inside the month, 250 bags each.
+    await sales
+      .post('/api/daily-reports')
+      .send(reportPayload(shopA, product, { businessDate: '2020-02-01' }));
+    await sales
+      .post('/api/daily-reports')
+      .send(reportPayload(shopA, product, { businessDate: '2020-02-02' }));
+    await sales
+      .post('/api/daily-reports')
+      .send(reportPayload(shopA, product, { businessDate: '2020-02-03' }));
+    // Day after the month ends — must not be counted.
+    await sales
+      .post('/api/daily-reports')
+      .send(reportPayload(shopA, product, { businessDate: '2020-03-01' }));
+
+    const ownerAgent = await loginAgent(app, 'owner@test.dev');
+    const res = await ownerAgent.get('/api/daily-reports/monthly-summary?month=2020-02');
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.month).toBe('2020-02');
+    expect(res.body.data.rows).toHaveLength(1);
+    const row = res.body.data.rows[0];
+    expect(row.shop.id).toBe(shopA._id.toString());
+    expect(row.product.id).toBe(product._id.toString());
+    expect(row.reportCount).toBe(3);
+    expect(row.totalQuantitySold).toBe(750);
+  });
+
+  it('groups separate shop/product combinations into separate rows', async () => {
+    const { shopA, shopB, product, owner } = await setup();
+    await createOpeningStockDirect(shopA, product, owner, 1000, '2020-02-01');
+    await createOpeningStockDirect(shopB, product, owner, 1000, '2020-02-01');
+    const sales = await loginAgent(app, 'sales@test.dev');
+    await sales
+      .post('/api/daily-reports')
+      .send(reportPayload(shopA, product, { businessDate: '2020-02-05' }));
+
+    const ownerAgent = await loginAgent(app, 'owner@test.dev');
+    await ownerAgent
+      .post('/api/daily-reports')
+      .send(reportPayload(shopB, product, { businessDate: '2020-02-05' }));
+
+    const res = await ownerAgent.get('/api/daily-reports/monthly-summary?month=2020-02');
+    expect(res.status).toBe(200);
+    expect(res.body.data.rows).toHaveLength(2);
+  });
+
+  it('returns an empty list for a month with no reports', async () => {
+    await setup();
+    const ownerAgent = await loginAgent(app, 'owner@test.dev');
+
+    const res = await ownerAgent.get('/api/daily-reports/monthly-summary?month=2020-06');
+    expect(res.status).toBe(200);
+    expect(res.body.data.rows).toEqual([]);
+  });
+});
+
 describe('Price history independence', () => {
   it('changing the active ShopPrice does not alter an already-saved report', async () => {
     const { shopA, product, owner } = await setup();

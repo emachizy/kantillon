@@ -10,3 +10,9 @@ const LAGOS_DATE_FORMATTER = new Intl.DateTimeFormat('en-CA', {
 export function getTodayLagosBusinessDate() {
   return LAGOS_DATE_FORMATTER.format(new Date());
 }
+
+// YYYY-MM, derived from the same Lagos-aware date — never the browser's
+// local timezone.
+export function getCurrentLagosBusinessMonth() {
+  return getTodayLagosBusinessDate().slice(0, 7);
+}

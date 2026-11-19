@@ -35,3 +35,8 @@ export async function fetchDailySummary(businessDate) {
   const { data } = await apiClient.get('/daily-reports/summary', { params: { businessDate } });
   return data.data;
 }
+
+export async function fetchMonthlySummary(month) {
+  const { data } = await apiClient.get('/daily-reports/monthly-summary', { params: { month } });
+  return data.data;
+}
