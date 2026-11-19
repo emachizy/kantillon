@@ -810,88 +810,474 @@ describe('GET /api/daily-reports/summary', () => {
   });
 });
 
-describe('GET /api/daily-reports/monthly-summary', () => {
-  it('is OWNER-only', async () => {
-    const { shopA, product, owner } = await setup();
-    await createOpeningStockDirect(shopA, product, owner, 1000, '2020-02-10');
-    const sales = await loginAgent(app, 'sales@test.dev');
+describe('GET /api/daily-reports/monthly-summary/:shopId', () => {
+  function monthlySummaryUrl(shop, month) {
+    return `/api/daily-reports/monthly-summary/${shop._id}?month=${month}`;
+  }
 
-    const res = await sales.get('/api/daily-reports/monthly-summary?month=2020-02');
-    expect(res.status).toBe(403);
+  function correctionPayload(overrides = {}) {
+    return {
+      reason: 'Salesperson miscounted bags sold',
+      proposedSalesLines: [{ quantity: 300, unitPriceKobo: 1200000 }],
+      proposedPhysicalClosingStockQuantity: 700,
+      proposedActualAmountCollectedKobo: 360000000,
+      ...overrides,
+    };
+  }
+
+  describe('role-based access', () => {
+    it('lets OWNER view any shop, including one with no staff assigned', async () => {
+      const { shopB, product, owner } = await setup();
+      await createOpeningStockDirect(shopB, product, owner, 1000, '2020-02-10');
+      const ownerAgent = await loginAgent(app, 'owner@test.dev');
+
+      const res = await ownerAgent.get(monthlySummaryUrl(shopB, '2020-02'));
+      expect(res.status).toBe(200);
+      expect(res.body.data.shop.id).toBe(shopB._id.toString());
+    });
+
+    it('lets MANAGER view their assigned shop', async () => {
+      const { shopA, product, owner } = await setup();
+      await createOpeningStockDirect(shopA, product, owner, 1000, '2020-02-10');
+      const manager = await loginAgent(app, 'manager@test.dev');
+
+      const res = await manager.get(monthlySummaryUrl(shopA, '2020-02'));
+      expect(res.status).toBe(200);
+    });
+
+    it('rejects MANAGER viewing an unassigned shop', async () => {
+      const { shopB, product, owner } = await setup();
+      await createOpeningStockDirect(shopB, product, owner, 1000, '2020-02-10');
+      const manager = await loginAgent(app, 'manager@test.dev');
+
+      const res = await manager.get(monthlySummaryUrl(shopB, '2020-02'));
+      expect(res.status).toBe(403);
+    });
+
+    it('lets ADMIN view their assigned shop', async () => {
+      const { shopA, product, owner } = await setup();
+      await createOpeningStockDirect(shopA, product, owner, 1000, '2020-02-10');
+      await createTestUser({ role: ROLES.ADMIN, email: 'admin@test.dev', shopIds: [shopA._id] });
+      const admin = await loginAgent(app, 'admin@test.dev');
+
+      const res = await admin.get(monthlySummaryUrl(shopA, '2020-02'));
+      expect(res.status).toBe(200);
+    });
+
+    it('rejects ADMIN viewing an unassigned shop', async () => {
+      const { shopA, shopB, product, owner } = await setup();
+      await createOpeningStockDirect(shopB, product, owner, 1000, '2020-02-10');
+      await createTestUser({ role: ROLES.ADMIN, email: 'admin@test.dev', shopIds: [shopA._id] });
+      const admin = await loginAgent(app, 'admin@test.dev');
+
+      const res = await admin.get(monthlySummaryUrl(shopB, '2020-02'));
+      expect(res.status).toBe(403);
+    });
+
+    it('lets SALESPERSON view their assigned shop — same shop-scoping rule as GET /api/daily-reports', async () => {
+      const { shopA, product, owner } = await setup();
+      await createOpeningStockDirect(shopA, product, owner, 1000, '2020-02-10');
+      const sales = await loginAgent(app, 'sales@test.dev');
+
+      const res = await sales.get(monthlySummaryUrl(shopA, '2020-02'));
+      expect(res.status).toBe(200);
+    });
+
+    it('rejects SALESPERSON viewing an unassigned shop', async () => {
+      const { shopB, product, owner } = await setup();
+      await createOpeningStockDirect(shopB, product, owner, 1000, '2020-02-10');
+      const sales = await loginAgent(app, 'sales@test.dev');
+
+      const res = await sales.get(monthlySummaryUrl(shopB, '2020-02'));
+      expect(res.status).toBe(403);
+    });
+
+    it('404s for a well-formed but nonexistent shop id, even for OWNER', async () => {
+      await setup();
+      const ownerAgent = await loginAgent(app, 'owner@test.dev');
+      const fakeShopId = new mongoose.Types.ObjectId().toString();
+
+      const res = await ownerAgent.get(`/api/daily-reports/monthly-summary/${fakeShopId}?month=2020-02`);
+      expect(res.status).toBe(404);
+    });
   });
 
-  it('rejects a malformed month', async () => {
-    const { shopA, product, owner } = await setup();
-    await createOpeningStockDirect(shopA, product, owner, 1000, '2020-02-10');
-    const ownerAgent = await loginAgent(app, 'owner@test.dev');
+  describe('validation', () => {
+    it('rejects a malformed month', async () => {
+      const { shopA, product, owner } = await setup();
+      await createOpeningStockDirect(shopA, product, owner, 1000, '2020-02-10');
+      const ownerAgent = await loginAgent(app, 'owner@test.dev');
 
-    const res = await ownerAgent.get('/api/daily-reports/monthly-summary?month=2020-13');
-    expect(res.status).toBe(400);
+      const res = await ownerAgent.get(monthlySummaryUrl(shopA, '2020-13'));
+      expect(res.status).toBe(400);
+    });
   });
 
-  it('sums every report in the month for a shop/product, and excludes neighboring months', async () => {
-    const { shopA, product, owner } = await setup();
-    await createOpeningStockDirect(shopA, product, owner, 1000, '2020-01-31');
-    const sales = await loginAgent(app, 'sales@test.dev');
+  describe('month boundaries and totals', () => {
+    it('sums every report in the month for the shop, and excludes neighboring months', async () => {
+      const { shopA, product, owner } = await setup();
+      await createOpeningStockDirect(shopA, product, owner, 1000, '2020-01-31');
+      const sales = await loginAgent(app, 'sales@test.dev');
 
-    // Day before the month starts — must not be counted.
-    await sales
-      .post('/api/daily-reports')
-      .send(reportPayload(shopA, product, { businessDate: '2020-01-31' }));
-    // Three days inside the month, 250 bags each.
-    await sales
-      .post('/api/daily-reports')
-      .send(reportPayload(shopA, product, { businessDate: '2020-02-01' }));
-    await sales
-      .post('/api/daily-reports')
-      .send(reportPayload(shopA, product, { businessDate: '2020-02-02' }));
-    await sales
-      .post('/api/daily-reports')
-      .send(reportPayload(shopA, product, { businessDate: '2020-02-03' }));
-    // Day after the month ends — must not be counted.
-    await sales
-      .post('/api/daily-reports')
-      .send(reportPayload(shopA, product, { businessDate: '2020-03-01' }));
+      // Day before the month starts — must not be counted.
+      await sales
+        .post('/api/daily-reports')
+        .send(reportPayload(shopA, product, { businessDate: '2020-01-31' }));
+      // Three days inside the month, 250 bags each.
+      await sales
+        .post('/api/daily-reports')
+        .send(reportPayload(shopA, product, { businessDate: '2020-02-01' }));
+      await sales
+        .post('/api/daily-reports')
+        .send(reportPayload(shopA, product, { businessDate: '2020-02-02' }));
+      await sales
+        .post('/api/daily-reports')
+        .send(reportPayload(shopA, product, { businessDate: '2020-02-03' }));
+      // Day after the month ends — must not be counted.
+      await sales
+        .post('/api/daily-reports')
+        .send(reportPayload(shopA, product, { businessDate: '2020-03-01' }));
 
-    const ownerAgent = await loginAgent(app, 'owner@test.dev');
-    const res = await ownerAgent.get('/api/daily-reports/monthly-summary?month=2020-02');
+      const ownerAgent = await loginAgent(app, 'owner@test.dev');
+      const res = await ownerAgent.get(monthlySummaryUrl(shopA, '2020-02'));
 
-    expect(res.status).toBe(200);
-    expect(res.body.data.month).toBe('2020-02');
-    expect(res.body.data.rows).toHaveLength(1);
-    const row = res.body.data.rows[0];
-    expect(row.shop.id).toBe(shopA._id.toString());
-    expect(row.product.id).toBe(product._id.toString());
-    expect(row.reportCount).toBe(3);
-    expect(row.totalQuantitySold).toBe(750);
+      expect(res.status).toBe(200);
+      expect(res.body.data.month).toBe('2020-02');
+      expect(res.body.data.shop.id).toBe(shopA._id.toString());
+      expect(res.body.data.totals.daysReported).toBe(3);
+      expect(res.body.data.totals.totalQuantitySold).toBe(750);
+    });
+
+    it('never combines a different shop\'s reports into the selected shop\'s totals', async () => {
+      const { shopA, shopB, product, owner } = await setup();
+      await createOpeningStockDirect(shopA, product, owner, 1000, '2020-02-01');
+      await createOpeningStockDirect(shopB, product, owner, 1000, '2020-02-01');
+      const sales = await loginAgent(app, 'sales@test.dev');
+      await sales
+        .post('/api/daily-reports')
+        .send(reportPayload(shopA, product, { businessDate: '2020-02-05' }));
+
+      const ownerAgent = await loginAgent(app, 'owner@test.dev');
+      await ownerAgent
+        .post('/api/daily-reports')
+        .send(reportPayload(shopB, product, { businessDate: '2020-02-05' }));
+
+      const shopARes = await ownerAgent.get(monthlySummaryUrl(shopA, '2020-02'));
+      expect(shopARes.body.data.totals.totalQuantitySold).toBe(250);
+      const shopBRes = await ownerAgent.get(monthlySummaryUrl(shopB, '2020-02'));
+      expect(shopBRes.body.data.totals.totalQuantitySold).toBe(250);
+    });
+
+    it('a SALESPERSON viewing their own assigned shop never sees figures from an unassigned shop leaking in', async () => {
+      const { shopA, shopB, product, owner } = await setup();
+      await createOpeningStockDirect(shopA, product, owner, 1000, '2020-02-01');
+      await createOpeningStockDirect(shopB, product, owner, 1000, '2020-02-01');
+      const sales = await loginAgent(app, 'sales@test.dev'); // assigned to shopA only
+      await sales
+        .post('/api/daily-reports')
+        .send(reportPayload(shopA, product, { businessDate: '2020-02-05' }));
+
+      const ownerAgent = await loginAgent(app, 'owner@test.dev');
+      // A much larger sale on shopB, which this salesperson cannot access —
+      // if it ever leaked in, the total below would be 250 + 900 = 1150.
+      await ownerAgent.post('/api/daily-reports').send(
+        reportPayload(shopB, product, {
+          businessDate: '2020-02-05',
+          salesLines: [{ quantity: 900, unitPriceKobo: 1200000 }],
+          physicalClosingStockQuantity: 100,
+          actualAmountCollectedKobo: 1080000000,
+        })
+      );
+
+      const res = await sales.get(monthlySummaryUrl(shopA, '2020-02'));
+      expect(res.status).toBe(200);
+      expect(res.body.data.totals.totalQuantitySold).toBe(250);
+    });
+
+    it('returns a well-shaped, zeroed result for a month with no reports', async () => {
+      const { shopA } = await setup();
+      const ownerAgent = await loginAgent(app, 'owner@test.dev');
+
+      const res = await ownerAgent.get(monthlySummaryUrl(shopA, '2020-06'));
+      expect(res.status).toBe(200);
+      expect(res.body.data.totals).toEqual({
+        totalQuantitySold: 0,
+        expectedRevenueKobo: 0,
+        actualAmountCollectedKobo: 0,
+        moneyVarianceKobo: 0,
+        stockVarianceQuantity: 0,
+        daysReported: 0,
+      });
+      expect(res.body.data.products).toEqual([]);
+      expect(res.body.data.days).toEqual([]);
+    });
   });
 
-  it('groups separate shop/product combinations into separate rows', async () => {
-    const { shopA, shopB, product, owner } = await setup();
-    await createOpeningStockDirect(shopA, product, owner, 1000, '2020-02-01');
-    await createOpeningStockDirect(shopB, product, owner, 1000, '2020-02-01');
-    const sales = await loginAgent(app, 'sales@test.dev');
-    await sales
-      .post('/api/daily-reports')
-      .send(reportPayload(shopA, product, { businessDate: '2020-02-05' }));
+  describe('product breakdown', () => {
+    it('groups two products in the same shop into separate rows, never combined', async () => {
+      const { shopA, product, owner } = await setup();
+      const productB = await createTestProduct({ name: 'Dangote Cement' });
+      await createOpeningStockDirect(shopA, product, owner, 1000, '2020-02-01');
+      await createOpeningStockDirect(shopA, productB, owner, 1000, '2020-02-01');
+      const sales = await loginAgent(app, 'sales@test.dev');
 
-    const ownerAgent = await loginAgent(app, 'owner@test.dev');
-    await ownerAgent
-      .post('/api/daily-reports')
-      .send(reportPayload(shopB, product, { businessDate: '2020-02-05' }));
+      await sales.post('/api/daily-reports').send(reportPayload(shopA, product, { businessDate: '2020-02-05' }));
+      await sales
+        .post('/api/daily-reports')
+        .send(reportPayload(shopA, productB, { businessDate: '2020-02-05' }));
 
-    const res = await ownerAgent.get('/api/daily-reports/monthly-summary?month=2020-02');
-    expect(res.status).toBe(200);
-    expect(res.body.data.rows).toHaveLength(2);
+      const ownerAgent = await loginAgent(app, 'owner@test.dev');
+      const res = await ownerAgent.get(monthlySummaryUrl(shopA, '2020-02'));
+
+      expect(res.body.data.products).toHaveLength(2);
+      const names = res.body.data.products.map((p) => p.product.name).sort();
+      expect(names).toEqual(['Dangote Cement', 'Lafarge Cement']);
+    });
   });
 
-  it('returns an empty list for a month with no reports', async () => {
-    await setup();
-    const ownerAgent = await loginAgent(app, 'owner@test.dev');
+  describe('daily breakdown', () => {
+    it('groups by businessDate, not by submission/UTC timestamp, and sums same-day multi-product activity', async () => {
+      const { shopA, product, owner } = await setup();
+      const productB = await createTestProduct({ name: 'Dangote Cement' });
+      await createOpeningStockDirect(shopA, product, owner, 1000, '2020-02-01');
+      await createOpeningStockDirect(shopA, productB, owner, 1000, '2020-02-01');
+      const sales = await loginAgent(app, 'sales@test.dev');
 
-    const res = await ownerAgent.get('/api/daily-reports/monthly-summary?month=2020-06');
-    expect(res.status).toBe(200);
-    expect(res.body.data.rows).toEqual([]);
+      await sales.post('/api/daily-reports').send(reportPayload(shopA, product, { businessDate: '2020-02-05' }));
+      await sales
+        .post('/api/daily-reports')
+        .send(reportPayload(shopA, productB, { businessDate: '2020-02-05' }));
+      await sales.post('/api/daily-reports').send(reportPayload(shopA, product, { businessDate: '2020-02-06' }));
+
+      const ownerAgent = await loginAgent(app, 'owner@test.dev');
+      const res = await ownerAgent.get(monthlySummaryUrl(shopA, '2020-02'));
+
+      expect(res.body.data.days).toHaveLength(2);
+      const feb5 = res.body.data.days.find((d) => d.businessDate === '2020-02-05');
+      const feb6 = res.body.data.days.find((d) => d.businessDate === '2020-02-06');
+      expect(feb5.totalQuantitySold).toBe(500); // both products, 250 each
+      expect(feb6.totalQuantitySold).toBe(250);
+    });
+  });
+
+  describe('historical revenue preservation', () => {
+    it('is unaffected by a ShopPrice change made after the report was submitted', async () => {
+      const { shopA, product, owner } = await setup();
+      await createOpeningStockDirect(shopA, product, owner, 1000, '2020-02-10');
+      const sales = await loginAgent(app, 'sales@test.dev');
+      await sales.post('/api/daily-reports').send(
+        reportPayload(shopA, product, {
+          businessDate: '2020-02-10',
+          salesLines: [{ quantity: 250, unitPriceKobo: 1200000 }],
+        })
+      );
+
+      const { ShopPrice } = await import('../src/models/ShopPrice.js');
+      await ShopPrice.create({
+        shopId: shopA._id,
+        productId: product._id,
+        priceKobo: 9999999,
+        changedBy: owner._id,
+      });
+
+      const ownerAgent = await loginAgent(app, 'owner@test.dev');
+      const res = await ownerAgent.get(monthlySummaryUrl(shopA, '2020-02'));
+      // 250 bags at the ORIGINAL 1,200,000 kobo/bag locked into the report,
+      // never the new ShopPrice.
+      expect(res.body.data.totals.expectedRevenueKobo).toBe(300000000);
+    });
+  });
+
+  describe('approved corrections', () => {
+    async function submitAndCorrect(ownerAgent, salesAgent, shop, product, owner, { approve, reject } = {}) {
+      await createOpeningStockDirect(shop, product, owner, 1000, '2020-02-10');
+      const submitRes = await salesAgent
+        .post('/api/daily-reports')
+        .send(reportPayload(shop, product, { businessDate: '2020-02-10' }));
+      const reportId = submitRes.body.data.report._id;
+
+      const reqRes = await salesAgent
+        .post(`/api/daily-reports/${reportId}/corrections`)
+        .send(correctionPayload());
+      const requestId = reqRes.body.data.request._id;
+
+      if (approve) await ownerAgent.post(`/api/correction-requests/${requestId}/approve`);
+      if (reject) await ownerAgent.post(`/api/correction-requests/${requestId}/reject`).send({ reason: 'No' });
+
+      return { reportId, requestId };
+    }
+
+    it('reflects the approved correction, not the original submission, in monthly totals', async () => {
+      const { shopA, product, owner } = await setup();
+      const sales = await loginAgent(app, 'sales@test.dev');
+      const ownerAgent = await loginAgent(app, 'owner@test.dev');
+
+      await submitAndCorrect(ownerAgent, sales, shopA, product, owner, { approve: true });
+
+      const res = await ownerAgent.get(monthlySummaryUrl(shopA, '2020-02'));
+      // Original submission was 250 bags (reportPayload default); the
+      // approved correction changes it to 300 — the monthly total must
+      // show 300, not 250, and not 550 (the two summed together).
+      expect(res.body.data.totals.totalQuantitySold).toBe(300);
+      expect(res.body.data.totals.expectedRevenueKobo).toBe(360000000);
+      expect(res.body.data.totals.daysReported).toBe(1);
+    });
+
+    it('a pending (unreviewed) correction request does not affect monthly totals', async () => {
+      const { shopA, product, owner } = await setup();
+      const sales = await loginAgent(app, 'sales@test.dev');
+      const ownerAgent = await loginAgent(app, 'owner@test.dev');
+
+      await submitAndCorrect(ownerAgent, sales, shopA, product, owner, {});
+
+      const res = await ownerAgent.get(monthlySummaryUrl(shopA, '2020-02'));
+      // Still the ORIGINAL 250 bags — the correction was never approved.
+      expect(res.body.data.totals.totalQuantitySold).toBe(250);
+    });
+
+    it('a rejected correction request does not affect monthly totals', async () => {
+      const { shopA, product, owner } = await setup();
+      const sales = await loginAgent(app, 'sales@test.dev');
+      const ownerAgent = await loginAgent(app, 'owner@test.dev');
+
+      await submitAndCorrect(ownerAgent, sales, shopA, product, owner, { reject: true });
+
+      const res = await ownerAgent.get(monthlySummaryUrl(shopA, '2020-02'));
+      expect(res.body.data.totals.totalQuantitySold).toBe(250);
+    });
+
+    it('never double-counts the original and the corrected figures together', async () => {
+      const { shopA, product, owner } = await setup();
+      const sales = await loginAgent(app, 'sales@test.dev');
+      const ownerAgent = await loginAgent(app, 'owner@test.dev');
+
+      await submitAndCorrect(ownerAgent, sales, shopA, product, owner, { approve: true });
+
+      const res = await ownerAgent.get(monthlySummaryUrl(shopA, '2020-02'));
+      // Exactly one report exists for the month — the correction replaces
+      // its effective value rather than adding a second entry.
+      expect(res.body.data.totals.daysReported).toBe(1);
+      expect(res.body.data.totals.totalQuantitySold).not.toBe(550);
+      expect(res.body.data.totals.totalQuantitySold).toBe(300);
+    });
+
+    it('two successive approved corrections: only the latest (correction #2) counts, never #1 or the original', async () => {
+      const { shopA, product, owner } = await setup();
+      const sales = await loginAgent(app, 'sales@test.dev');
+      const ownerAgent = await loginAgent(app, 'owner@test.dev');
+      await createOpeningStockDirect(shopA, product, owner, 1000, '2020-02-10');
+
+      const submitRes = await sales
+        .post('/api/daily-reports')
+        .send(reportPayload(shopA, product, { businessDate: '2020-02-10' }));
+      const reportId = submitRes.body.data.report._id;
+
+      // Correction #1: 250 (original) -> 300.
+      const req1 = await sales.post(`/api/daily-reports/${reportId}/corrections`).send(correctionPayload());
+      await ownerAgent.post(`/api/correction-requests/${req1.body.data.request._id}/approve`);
+
+      // Correction #2, on the SAME report: 300 -> 350.
+      const req2 = await sales.post(`/api/daily-reports/${reportId}/corrections`).send(
+        correctionPayload({
+          proposedSalesLines: [{ quantity: 350, unitPriceKobo: 1200000 }],
+          proposedPhysicalClosingStockQuantity: 650,
+          proposedActualAmountCollectedKobo: 420000000,
+        })
+      );
+      const approve2 = await ownerAgent.post(`/api/correction-requests/${req2.body.data.request._id}/approve`);
+      expect(approve2.body.data.correction.correctionNumber).toBe(2);
+
+      const res = await ownerAgent.get(monthlySummaryUrl(shopA, '2020-02'));
+      // Must be exactly 350 — never 250+300+350 (900), never 300+350 (650),
+      // and never the superseded 300.
+      expect(res.body.data.totals.totalQuantitySold).toBe(350);
+      expect(res.body.data.totals.expectedRevenueKobo).toBe(420000000);
+    });
+
+    it('an approved correction updates the product breakdown, not just the month total', async () => {
+      const { shopA, product, owner } = await setup();
+      const sales = await loginAgent(app, 'sales@test.dev');
+      const ownerAgent = await loginAgent(app, 'owner@test.dev');
+
+      await submitAndCorrect(ownerAgent, sales, shopA, product, owner, { approve: true });
+
+      const res = await ownerAgent.get(monthlySummaryUrl(shopA, '2020-02'));
+      expect(res.body.data.products).toHaveLength(1);
+      expect(res.body.data.products[0].totalQuantitySold).toBe(300);
+      expect(res.body.data.products[0].expectedRevenueKobo).toBe(360000000);
+    });
+
+    it('an approved correction updates the daily breakdown, not just the month total', async () => {
+      const { shopA, product, owner } = await setup();
+      const sales = await loginAgent(app, 'sales@test.dev');
+      const ownerAgent = await loginAgent(app, 'owner@test.dev');
+
+      await submitAndCorrect(ownerAgent, sales, shopA, product, owner, { approve: true });
+
+      const res = await ownerAgent.get(monthlySummaryUrl(shopA, '2020-02'));
+      expect(res.body.data.days).toHaveLength(1);
+      expect(res.body.data.days[0].businessDate).toBe('2020-02-10');
+      expect(res.body.data.days[0].totalQuantitySold).toBe(300);
+      expect(res.body.data.days[0].expectedRevenueKobo).toBe(360000000);
+    });
+  });
+
+  describe('internal consistency', () => {
+    async function multiProductMultiDayScenario() {
+      const { shopA, product, owner } = await setup();
+      const productB = await createTestProduct({ name: 'Dangote Cement' });
+      await createOpeningStockDirect(shopA, product, owner, 1000, '2020-02-01');
+      await createOpeningStockDirect(shopA, productB, owner, 1000, '2020-02-01');
+      const sales = await loginAgent(app, 'sales@test.dev');
+      const ownerAgent = await loginAgent(app, 'owner@test.dev');
+
+      await sales.post('/api/daily-reports').send(reportPayload(shopA, product, { businessDate: '2020-02-05' }));
+      await sales
+        .post('/api/daily-reports')
+        .send(reportPayload(shopA, productB, { businessDate: '2020-02-05' }));
+      const dayTwoRes = await sales
+        .post('/api/daily-reports')
+        .send(reportPayload(shopA, product, { businessDate: '2020-02-06' }));
+
+      // Correct the day-two report too, so the consistency check is
+      // exercised against a mix of original AND corrected reports, not
+      // only original ones.
+      const reqRes = await sales
+        .post(`/api/daily-reports/${dayTwoRes.body.data.report._id}/corrections`)
+        .send(correctionPayload());
+      await ownerAgent.post(`/api/correction-requests/${reqRes.body.data.request._id}/approve`);
+
+      return { shopA, ownerAgent };
+    }
+
+    it('month totals equal the sum of the product breakdown', async () => {
+      const { shopA, ownerAgent } = await multiProductMultiDayScenario();
+      const res = await ownerAgent.get(monthlySummaryUrl(shopA, '2020-02'));
+      const { totals, products } = res.body.data;
+
+      expect(products.length).toBeGreaterThan(0);
+      expect(totals.totalQuantitySold).toBe(products.reduce((sum, p) => sum + p.totalQuantitySold, 0));
+      expect(totals.expectedRevenueKobo).toBe(
+        products.reduce((sum, p) => sum + p.expectedRevenueKobo, 0)
+      );
+      expect(totals.actualAmountCollectedKobo).toBe(
+        products.reduce((sum, p) => sum + p.actualAmountCollectedKobo, 0)
+      );
+    });
+
+    it('month totals equal the sum of the daily breakdown', async () => {
+      const { shopA, ownerAgent } = await multiProductMultiDayScenario();
+      const res = await ownerAgent.get(monthlySummaryUrl(shopA, '2020-02'));
+      const { totals, days } = res.body.data;
+
+      expect(days.length).toBeGreaterThan(0);
+      expect(totals.totalQuantitySold).toBe(days.reduce((sum, d) => sum + d.totalQuantitySold, 0));
+      expect(totals.expectedRevenueKobo).toBe(days.reduce((sum, d) => sum + d.expectedRevenueKobo, 0));
+      expect(totals.actualAmountCollectedKobo).toBe(
+        days.reduce((sum, d) => sum + d.actualAmountCollectedKobo, 0)
+      );
+      expect(totals.moneyVarianceKobo).toBe(days.reduce((sum, d) => sum + d.moneyVarianceKobo, 0));
+    });
   });
 });
 

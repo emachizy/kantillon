@@ -39,6 +39,22 @@ export async function getLatestApprovedCorrection(reportId) {
   return DailySalesCorrection.findOne({ dailySalesReportId: reportId }).sort({ correctionNumber: -1 });
 }
 
+// Bulk form of getLatestApprovedCorrection, for callers (e.g. a monthly
+// rollup) that need the effective version of many reports at once without
+// one query per report. Same rejected-never-produces-a-correction
+// guarantee applies — nothing extra to filter here either.
+export async function getLatestApprovedCorrectionsByReportIds(reportIds) {
+  const corrections = await DailySalesCorrection.find({ dailySalesReportId: { $in: reportIds } }).sort({
+    correctionNumber: -1,
+  });
+  const latestByReportId = new Map();
+  for (const correction of corrections) {
+    const key = correction.dailySalesReportId.toString();
+    if (!latestByReportId.has(key)) latestByReportId.set(key, correction);
+  }
+  return latestByReportId;
+}
+
 // "What is currently the effective SALE ledger effect for this report" —
 // the thing a NEW correction's quantity change must reverse. Correction #2
 // must reverse Correction #1's effective sale, not the original, so this
@@ -550,7 +566,13 @@ export async function getActiveMoneyResolutionMagnitude(reportId, effectiveCorre
   return result?.total ?? 0;
 }
 
-function effectiveSnapshotFrom(report, latestCorrection) {
+// Exported so any other reader of "what actually happened on this
+// report, right now" — e.g. services/dailySalesReportService.js's monthly
+// summary — uses this exact same effective-value logic rather than
+// re-deriving it. Pure/no I/O: callers fetch the report and its latest
+// correction themselves (see getLatestApprovedCorrectionsByReportIds below
+// for the bulk case).
+export function effectiveSnapshotFrom(report, latestCorrection) {
   if (latestCorrection) {
     return {
       salesLines: latestCorrection.salesLines,

@@ -78,9 +78,13 @@ export const getDailySummary = catchAsync(async (req, res) => {
   sendSuccess(res, { data: { businessDate, reports } });
 });
 
-// OWNER-only cross-shop rollup for one calendar month.
+// Single-shop monthly sales summary. Access to :shopId is enforced by
+// requireShopAccess in the route (OWNER any shop; everyone else only an
+// assigned shop) — never by role alone, same as every other shop-scoped
+// endpoint in this codebase.
 export const getMonthlySummaryHandler = catchAsync(async (req, res) => {
+  const { shopId } = req.params;
   const { month } = req.query;
-  const rows = await getMonthlySummary(month);
-  sendSuccess(res, { data: { month, rows } });
+  const summary = await getMonthlySummary(shopId, month);
+  sendSuccess(res, { data: summary });
 });

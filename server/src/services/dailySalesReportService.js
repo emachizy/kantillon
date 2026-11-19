@@ -12,6 +12,10 @@ import {
 } from './inventoryService.js';
 import { isFutureBusinessDate, getLagosBusinessDate } from '../utils/businessDate.js';
 import { runWithOptionalTransaction } from '../utils/transactionRunner.js';
+import {
+  getLatestApprovedCorrectionsByReportIds,
+  effectiveSnapshotFrom,
+} from './dailyReportCorrectionService.js';
 
 const REPORT_POPULATE = [
   { path: 'shopId', select: 'name code' },
@@ -305,62 +309,131 @@ function monthRange(month) {
   return { start, end };
 }
 
-// Owner-only, cross-shop monthly rollup: every shop/product combination
-// with at least one submitted report in the month, summed. Reuses raw
-// (as-submitted) report fields — the same level of correction-awareness
-// the existing per-day summary (getDailySummary) already uses; it does not
-// read the "effective" (post-correction) values the single-report detail
-// page shows. Two extra queries (not one per row) fetch shop/product names
-// for display, matching the existing getShopInventory /
-// getCurrentPricesForProduct pattern elsewhere in this codebase.
-export async function getMonthlySummary(month) {
-  const { start, end } = monthRange(month);
-
-  const rows = await DailySalesReport.aggregate([
-    { $match: { businessDate: { $gte: start, $lt: end } } },
-    {
-      $group: {
-        _id: { shopId: '$shopId', productId: '$productId' },
-        totalQuantitySold: { $sum: '$totalQuantitySold' },
-        expectedRevenueKobo: { $sum: '$expectedRevenueKobo' },
-        actualAmountCollectedKobo: { $sum: '$actualAmountCollectedKobo' },
-        moneyVarianceKobo: { $sum: '$moneyVarianceKobo' },
-        stockVarianceQuantity: { $sum: '$stockVarianceQuantity' },
-        reportCount: { $sum: 1 },
-      },
+function emptyMonthlySummary(shop, month) {
+  return {
+    shop: { id: shop._id, name: shop.name, code: shop.code },
+    month,
+    totals: {
+      totalQuantitySold: 0,
+      expectedRevenueKobo: 0,
+      actualAmountCollectedKobo: 0,
+      moneyVarianceKobo: 0,
+      stockVarianceQuantity: 0,
+      daysReported: 0,
     },
-  ]);
+    products: [],
+    days: [],
+  };
+}
 
-  if (rows.length === 0) return [];
+// Single-shop monthly sales summary — a sales-performance view, not a
+// reconciliation report: quantity sold, expected/collected revenue, and
+// variance only as supporting context. Scoped to exactly one shop (callers
+// must already have passed requireShopAccess for that shop; this function
+// trusts shopId as given). Every report's EFFECTIVE figures are used —
+// the latest APPROVED correction if one exists, otherwise the original
+// report — via effectiveSnapshotFrom, the same function
+// getEffectiveDailyReport() uses for a single report, so a monthly total
+// can never silently disagree with what the report detail page shows for
+// the same day. A pending or rejected correction request never produces a
+// DailySalesCorrection row (see dailyReportCorrectionService.js), so
+// neither can ever affect this total — and because exactly one effective
+// value (never both original-and-corrected) is summed per report, nothing
+// is ever double-counted.
+export async function getMonthlySummary(shopId, month) {
+  const shop = await Shop.findById(shopId).select('name code');
+  if (!shop) throw ApiError.notFound('Shop not found');
 
-  const shopIds = [...new Set(rows.map((row) => row._id.shopId.toString()))];
-  const productIds = [...new Set(rows.map((row) => row._id.productId.toString()))];
+  const { start, end } = monthRange(month);
+  const reports = await DailySalesReport.find({
+    shopId,
+    businessDate: { $gte: start, $lt: end },
+  }).select(
+    'productId businessDate totalQuantitySold expectedRevenueKobo actualAmountCollectedKobo moneyVarianceKobo stockVarianceQuantity'
+  );
 
-  const [shops, products] = await Promise.all([
-    Shop.find({ _id: { $in: shopIds } }).select('name code'),
-    Product.find({ _id: { $in: productIds } }).select('name unit'),
-  ]);
-  const shopById = new Map(shops.map((shop) => [shop._id.toString(), shop]));
-  const productById = new Map(products.map((product) => [product._id.toString(), product]));
+  if (reports.length === 0) return emptyMonthlySummary(shop, month);
 
-  return rows
-    .map((row) => {
-      const shop = shopById.get(row._id.shopId.toString());
-      const product = productById.get(row._id.productId.toString());
+  const latestCorrectionByReportId = await getLatestApprovedCorrectionsByReportIds(
+    reports.map((report) => report._id)
+  );
+
+  const effectiveRows = reports.map((report) => ({
+    productId: report.productId,
+    businessDate: report.businessDate,
+    ...effectiveSnapshotFrom(report, latestCorrectionByReportId.get(report._id.toString())),
+  }));
+
+  const productIds = [...new Set(effectiveRows.map((row) => row.productId.toString()))];
+  const productDocs = await Product.find({ _id: { $in: productIds } }).select('name unit');
+  const productById = new Map(productDocs.map((product) => [product._id.toString(), product]));
+
+  const totals = effectiveRows.reduce(
+    (acc, row) => ({
+      totalQuantitySold: acc.totalQuantitySold + row.totalQuantitySold,
+      expectedRevenueKobo: acc.expectedRevenueKobo + row.expectedRevenueKobo,
+      actualAmountCollectedKobo: acc.actualAmountCollectedKobo + row.actualAmountCollectedKobo,
+      moneyVarianceKobo: acc.moneyVarianceKobo + row.moneyVarianceKobo,
+      stockVarianceQuantity: acc.stockVarianceQuantity + row.stockVarianceQuantity,
+    }),
+    {
+      totalQuantitySold: 0,
+      expectedRevenueKobo: 0,
+      actualAmountCollectedKobo: 0,
+      moneyVarianceKobo: 0,
+      stockVarianceQuantity: 0,
+    }
+  );
+  const daysReported = new Set(effectiveRows.map((row) => row.businessDate)).size;
+
+  const productTotalsById = new Map();
+  for (const row of effectiveRows) {
+    const key = row.productId.toString();
+    const existing = productTotalsById.get(key) || {
+      totalQuantitySold: 0,
+      expectedRevenueKobo: 0,
+      actualAmountCollectedKobo: 0,
+    };
+    productTotalsById.set(key, {
+      totalQuantitySold: existing.totalQuantitySold + row.totalQuantitySold,
+      expectedRevenueKobo: existing.expectedRevenueKobo + row.expectedRevenueKobo,
+      actualAmountCollectedKobo: existing.actualAmountCollectedKobo + row.actualAmountCollectedKobo,
+    });
+  }
+  const products = [...productTotalsById.entries()]
+    .map(([productId, productTotals]) => {
+      const product = productById.get(productId);
       return {
-        shop: shop ? { id: shop._id, name: shop.name, code: shop.code } : null,
         product: product ? { id: product._id, name: product.name, unit: product.unit } : null,
-        totalQuantitySold: row.totalQuantitySold,
-        expectedRevenueKobo: row.expectedRevenueKobo,
-        actualAmountCollectedKobo: row.actualAmountCollectedKobo,
-        moneyVarianceKobo: row.moneyVarianceKobo,
-        stockVarianceQuantity: row.stockVarianceQuantity,
-        reportCount: row.reportCount,
+        ...productTotals,
       };
     })
-    .sort(
-      (a, b) =>
-        (a.shop?.name || '').localeCompare(b.shop?.name || '') ||
-        (a.product?.name || '').localeCompare(b.product?.name || '')
-    );
+    .sort((a, b) => (a.product?.name || '').localeCompare(b.product?.name || ''));
+
+  const dayTotalsByDate = new Map();
+  for (const row of effectiveRows) {
+    const existing = dayTotalsByDate.get(row.businessDate) || {
+      totalQuantitySold: 0,
+      expectedRevenueKobo: 0,
+      actualAmountCollectedKobo: 0,
+      moneyVarianceKobo: 0,
+    };
+    dayTotalsByDate.set(row.businessDate, {
+      totalQuantitySold: existing.totalQuantitySold + row.totalQuantitySold,
+      expectedRevenueKobo: existing.expectedRevenueKobo + row.expectedRevenueKobo,
+      actualAmountCollectedKobo: existing.actualAmountCollectedKobo + row.actualAmountCollectedKobo,
+      moneyVarianceKobo: existing.moneyVarianceKobo + row.moneyVarianceKobo,
+    });
+  }
+  const days = [...dayTotalsByDate.entries()]
+    .map(([businessDate, dayTotals]) => ({ businessDate, ...dayTotals }))
+    .sort((a, b) => (a.businessDate < b.businessDate ? -1 : a.businessDate > b.businessDate ? 1 : 0));
+
+  return {
+    shop: { id: shop._id, name: shop.name, code: shop.code },
+    month,
+    totals: { ...totals, daysReported },
+    products,
+    days,
+  };
 }

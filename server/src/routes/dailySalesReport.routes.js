@@ -28,6 +28,7 @@ import {
   dailySummaryQuerySchema,
   monthlySummaryQuerySchema,
 } from '../validators/dailySalesReport.validators.js';
+import { shopIdParamSchema } from '../validators/userManagement.validators.js';
 import { createCorrectionRequestSchema } from '../validators/dailyReportCorrection.validators.js';
 import { createStockVarianceResolutionSchema } from '../validators/stockVarianceResolution.validators.js';
 import { createMoneyVarianceResolutionSchema } from '../validators/moneyVarianceResolution.validators.js';
@@ -48,7 +49,7 @@ router.post(
 );
 
 // Must be registered before GET '/:id' — otherwise Express would match
-// "/summary" / "/monthly-summary" as an :id value.
+// "/summary" / "/monthly-summary/..." as an :id value.
 router.get(
   '/summary',
   requireAuth,
@@ -57,10 +58,15 @@ router.get(
   getDailySummary
 );
 
+// Single-shop monthly sales summary — shop-scoped like every other
+// per-shop endpoint (requireShopAccess), not OWNER-only: OWNER may view any
+// shop, everyone else only one they're assigned to, exactly as
+// GET /api/daily-reports already behaves for SALESPERSON/MANAGER/ADMIN.
 router.get(
-  '/monthly-summary',
+  '/monthly-summary/:shopId',
   requireAuth,
-  requireRole(ROLES.OWNER),
+  validate(shopIdParamSchema, 'params'),
+  requireShopAccess('shopId', 'params'),
   validate(monthlySummaryQuerySchema, 'query'),
   getMonthlySummaryHandler
 );

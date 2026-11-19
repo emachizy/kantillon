@@ -203,6 +203,14 @@ export function ShopInventoryPage() {
         )}
       </div>
 
+      {/* Visible to anyone who can open this shop's inventory, not just
+          OWNER — access to the summary itself is still enforced
+          server-side (requireShopAccess), and since this page already
+          requires access to this exact shop, the link always succeeds. */}
+      <Link to={`/monthly-summary/${shopId}`} className="inline-block text-xs font-medium text-slate-500">
+        Monthly sales summary →
+      </Link>
+
       {singleLine && (
         <div className="rounded-xl border border-slate-200 bg-white p-3">
           <p className="text-xs font-medium text-slate-500">Current Stock</p>

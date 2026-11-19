@@ -42,6 +42,7 @@ export default function App() {
           <Route path="/daily-reports/:id/request-correction" element={<CorrectionRequestFormPage />} />
           <Route path="/daily-summary" element={<OwnerDailySummaryPage />} />
           <Route path="/monthly-summary" element={<OwnerMonthlySummaryPage />} />
+          <Route path="/monthly-summary/:shopId" element={<OwnerMonthlySummaryPage />} />
           <Route path="/approvals" element={<PendingApprovalsPage />} />
           <Route path="/receipts" element={<ReceiptHistoryPage />} />
           {/* OWNER-only pages — OwnerRoute redirects non-owners to "/" as a
